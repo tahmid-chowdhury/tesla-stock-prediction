@@ -1,74 +1,60 @@
-# Tesla Stock Prediction
+# Tesla Stock Price Prediction & Trading Agent
 
-This project aims to predict Tesla's stock movements using an LSTM (Long Short-Term Memory) machine learning model. The model is trained on historical stock price data and can be used to forecast future price movements.
+This project implements a machine learning-based trading agent that predicts Tesla stock movements and makes trading decisions in a simulated environment. The simulation covers the trading days from March 24-28, 2025.
+
+## Project Overview
+
+The trading agent uses deep learning (LSTM) to analyze historical Tesla stock data and make daily trading decisions (Buy, Sell, or Hold) with the goal of maximizing the final account balance.
+
+## Trading Rules
+
+- Simulation Period: March 24-28, 2025 (5 trading days)
+- Trading Schedule:
+  - 9:00 AM (EST): Generate trading advice
+  - 10:00 AM (EST): Execute orders at current price
+- Starting Capital: $10,000 USD
+- Transaction Fee: 1% per Buy/Sell order
+
+## Trading Strategy
+
+The trading strategy combines multiple approaches:
+
+1. **Price Prediction**: LSTM model predicts next-day closing prices
+2. **Technical Analysis**: Using indicators like RSI, MACD, and Bollinger Bands
+3. **Risk Management**: Adjusts position size based on volatility
+4. **Decision Rules**:
+   - Buy when predicted price increase > 2%
+   - Sell when predicted price decrease > 2%
+   - Hold otherwise
+   - Transaction size based on risk factor (0.1-0.5 of available capital)
 
 ## Project Structure
 
 ```
-tesla-stock-prediction
-├── data
-│   ├── raw                # Directory for raw stock data (CSV files)
-│   └── processed          # Directory for processed data ready for modeling
-├── src
-│   ├── model.py           # Defines the LSTM model architecture
-│   ├── train.py           # Responsible for training the LSTM model
-│   └── predict.py         # Used for making predictions with the trained model
-├── utils
-│   └── data_preprocessing.py # Contains utility functions for data preprocessing
-├── requirements.txt       # Lists the required Python dependencies
-└── README.md              # Documentation for the project
+/tesla-stock-prediction/
+├── data/
+│   ├── raw/        # Raw stock data
+│   └── processed/  # Processed features
+├── models/         # Trained ML models
+├── src/
+│   ├── data/       # Data preprocessing
+│   ├── models/     # ML model definition
+│   ├── agent/      # Trading agent logic
+│   └── evaluation/ # Backtesting framework
+├── results/        # Simulation results
+├── main.py         # Main execution script
+└── README.md       # Project documentation
 ```
 
-## Setup Instructions
+## Model Architecture
 
-1. **Clone the Repository**
-   ```
-   git clone <repository-url>
-   cd tesla-stock-prediction
-   ```
+The prediction model uses a stacked LSTM neural network:
+- Input: Sequence of 10 days of technical indicators
+- Architecture: 2 LSTM layers (50 units each) with dropout
+- Output: Next-day predicted price
 
-2. **Create a Virtual Environment**
-   ```
-   python -m venv venv
-   source venv/bin/activate  # On Windows use `venv\Scripts\activate`
-   ```
+## Performance Analysis
 
-3. **Install Dependencies**
-   ```
-   pip install -r requirements.txt
-   ```
-
-## Data Preparation
-
-- Place the raw stock data files in the `data/raw` directory.
-- Run the data preprocessing script to clean and prepare the data for training:
-  ```
-  python -m utils.data_preprocessing
-  ```
-
-## Training the Model
-
-- To train the LSTM model, execute the following command:
-  ```
-  python src/train.py
-  ```
-
-## Making Predictions
-
-- After training, you can make predictions using the trained model:
-  ```
-  python src/predict.py
-  ```
-
-## Trading Strategy
-
-To execute the trading strategy using the model's predictions:
-```
-python src/trading_strategy.py
-```
-
-Ensure that you have placed the latest raw market data (with a 'close' column) in the `data/raw/latest_data.csv` file.
-
-## License
-
-This project is licensed under the MIT License. See the LICENSE file for details.
+The trading agent's performance is evaluated based on:
+1. Final portfolio value
+2. Total return
