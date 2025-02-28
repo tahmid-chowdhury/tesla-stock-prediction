@@ -28,9 +28,9 @@ class TradingAgent:
         
     def calculate_risk_factor(self, data):
         """Calculate risk factor based on volatility and other metrics"""
-        # Get volatility from the last row of data
-        volatility = data[-1, -2]  # Assuming volatility is the second last column
-        rsi = data[-1, 5]  # RSI at current position
+        # Volatility is now at index 10 in the feature list after our TA-Lib replacement
+        volatility = data[-1, 10]  # Assuming volatility is at index 10
+        rsi = data[-1, 5]  # RSI at index 5
         
         # Higher risk with high volatility or extreme RSI
         risk_factor = volatility * 2

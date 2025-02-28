@@ -1,0 +1,6 @@
+date,open_price,close_price,decision,amount,order,executed,balance,shares,portfolio_value
+2025-03-24,856.0649501581287,923.7106878095486,Hold,0,Hold: No transaction,False,10000,0,10000.0
+2025-03-25,888.017124065119,925.0121282789597,Hold,0,Hold: No transaction,False,10000,0,10000.0
+2025-03-26,951.2321475531768,993.9955939921857,Hold,0,Hold: No transaction,False,10000,0,10000.0
+2025-03-27,989.9376119324082,1024.7810783137688,Hold,0,Hold: No transaction,False,10000,0,10000.0
+2025-03-28,1035.301028635681,1028.916737134583,Hold,0,Hold: No transaction,False,10000,0,10000.0

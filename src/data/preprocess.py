@@ -2,7 +2,6 @@ import pandas as pd
 import numpy as np
 import os
 from sklearn.preprocessing import MinMaxScaler
-import talib
 
 def load_data(file_path):
     """Load raw TSLA stock data"""
@@ -12,6 +11,51 @@ def load_data(file_path):
     df = df.sort_values('Date')
     return df
 
+def calculate_rsi(series, window=14):
+    """Calculate RSI using pandas"""
+    delta = series.diff()
+    
+    # Make two series: one for gains and one for losses
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    
+    # Calculate the EWMA (Exponentially Weighted Moving Average)
+    roll_up = up.ewm(com=window-1, adjust=False).mean()
+    roll_down = down.ewm(com=window-1, adjust=False).mean()
+    
+    # Calculate the RSI based on EWMA
+    rs = roll_up / roll_down
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    
+    return rsi
+
+def calculate_macd(series, fast=12, slow=26, signal=9):
+    """Calculate MACD using pandas"""
+    # Calculate the Fast and Slow Exponential Moving Averages
+    fast_ema = series.ewm(span=fast, adjust=False).mean()
+    slow_ema = series.ewm(span=slow, adjust=False).mean()
+    
+    # Calculate the MACD line
+    macd = fast_ema - slow_ema
+    
+    # Calculate the signal line
+    signal_line = macd.ewm(span=signal, adjust=False).mean()
+    
+    # Calculate the histogram
+    histogram = macd - signal_line
+    
+    return macd, signal_line, histogram
+
+def calculate_bollinger_bands(series, window=20, num_std=2):
+    """Calculate Bollinger Bands using pandas"""
+    rolling_mean = series.rolling(window=window).mean()
+    rolling_std = series.rolling(window=window).std()
+    
+    upper_band = rolling_mean + (rolling_std * num_std)
+    lower_band = rolling_mean - (rolling_std * num_std)
+    
+    return upper_band, rolling_mean, lower_band
+
 def add_technical_indicators(df):
     """Add technical indicators as features"""
     # Calculate moving averages
@@ -20,18 +64,18 @@ def add_technical_indicators(df):
     df['MA20'] = df['Close'].rolling(window=20).mean()
     
     # Calculate RSI (Relative Strength Index)
-    df['RSI'] = talib.RSI(df['Close'].values, timeperiod=14)
+    df['RSI'] = calculate_rsi(df['Close'], window=14)
     
     # MACD (Moving Average Convergence Divergence)
-    macd, macd_signal, macd_hist = talib.MACD(
-        df['Close'].values, fastperiod=12, slowperiod=26, signalperiod=9)
+    macd, macd_signal, macd_hist = calculate_macd(
+        df['Close'], fast=12, slow=26, signal=9)
     df['MACD'] = macd
     df['MACD_signal'] = macd_signal
     df['MACD_hist'] = macd_hist
     
     # Bollinger Bands
-    upper, middle, lower = talib.BBANDS(
-        df['Close'].values, timeperiod=20, nbdevup=2, nbdevdn=2, matype=0)
+    upper, middle, lower = calculate_bollinger_bands(
+        df['Close'], window=20, num_std=2)
     df['BB_upper'] = upper
     df['BB_middle'] = middle
     df['BB_lower'] = lower

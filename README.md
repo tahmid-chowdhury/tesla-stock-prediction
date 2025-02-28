@@ -15,6 +15,16 @@ The trading agent uses deep learning (LSTM) to analyze historical Tesla stock da
 - Starting Capital: $10,000 USD
 - Transaction Fee: 1% per Buy/Sell order
 
+## Technical Indicators Used
+
+The model analyzes the following technical indicators:
+- Moving Averages (5, 10, 20 days)
+- RSI (Relative Strength Index)
+- MACD (Moving Average Convergence Divergence)
+- Bollinger Bands
+- Volatility
+- Price Returns
+
 ## Trading Strategy
 
 The trading strategy combines multiple approaches:
