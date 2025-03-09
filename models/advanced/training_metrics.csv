@@ -1,0 +1,1 @@
+timestamp,model_type,epochs,best_epoch,train_mse,val_mse,test_mse,train_r2,val_r2,test_r2,accuracy,precision,recall,f1_score,training_time,notes
