@@ -3,178 +3,210 @@ import numpy as np
 from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
 import os
+import sys
+
+# Add project root to path for imports
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+
+# Import visualization utilities
+from src.visualization.visualizer import plot_stock_history_and_prediction, plot_trading_simulation_results
 
 class TradingSimulation:
-    def __init__(self, agent, processed_data, sequence_length, start_date=None, end_date=None):
+    def __init__(self, agent, data, sequence_length, start_date, end_date):
         """
-        Initialize trading simulation
+        Initialize backtesting environment
         
         Parameters:
-        - agent: Trading agent
-        - processed_data: Processed stock data
-        - sequence_length: Length of sequence for predictions
-        - start_date: Start date for simulation (str or datetime)
-        - end_date: End date for simulation (str or datetime)
+        - agent: Trading agent instance
+        - data: Processed data DataFrame
+        - sequence_length: Length of input sequences for prediction
+        - start_date: Start date for simulation
+        - end_date: End date for simulation
         """
         self.agent = agent
-        self.data = processed_data
+        self.data = data
         self.sequence_length = sequence_length
+        self.start_date = start_date
+        self.end_date = end_date
+        self.results = None
         
-        # Set simulation date range
-        if start_date is None:
-            # Default to last week of March 2025 (March 24-28, 2025)
-            self.start_date = datetime(2025, 3, 24)
-        else:
-            self.start_date = pd.to_datetime(start_date)
-            
-        if end_date is None:
-            self.end_date = datetime(2025, 3, 28)
-        else:
-            self.end_date = pd.to_datetime(end_date)
+    def prepare_simulation_data(self):
+        """Prepare data for simulation"""
+        # Filter data for the simulation period
+        mask = (self.data['Date'] >= self.start_date) & (self.data['Date'] <= self.end_date)
+        sim_data = self.data[mask].copy()
         
-        self.results = []
-    
-    def generate_simulated_data(self):
-        """Generate simulated data for March 24-28, 2025 based on historical patterns"""
-        # Use the most recent data as a base
-        base_data = self.data.copy()
+        # Add columns for tracking simulation with proper data types
+        sim_data['Predicted'] = np.nan
+        sim_data['Decision'] = 'Hold'
+        sim_data['Amount'] = 0.0
         
-        # Create date range for simulation
-        simulation_dates = pd.date_range(start=self.start_date, end=self.end_date, freq='B')
+        # Ensure float type for numeric columns that will be updated
+        sim_data['Portfolio_Value'] = float(self.agent.initial_balance)
+        sim_data['Balance'] = float(self.agent.initial_balance)
+        sim_data['Shares'] = 0.0  # Changed to float to avoid dtype warnings
+        sim_data['Trade_Cost'] = 0.0
+        sim_data['Trade_Fee'] = 0.0
         
-        # Select recent price movements as a pattern
-        recent_pattern = base_data.tail(len(simulation_dates)).copy()
-        recent_pattern['Date'] = simulation_dates
+        return sim_data
         
-        # Add some random variation to prices (±3%)
-        for col in ['Open', 'High', 'Low', 'Close']:
-            variation = np.random.uniform(-0.03, 0.03, len(recent_pattern))
-            base_values = recent_pattern[col].values
-            recent_pattern[col] = base_values * (1 + variation)
-        
-        return recent_pattern
-    
     def run_simulation(self):
-        """Run the trading simulation"""
-        # Generate simulated data for March 24-28, 2025
-        simulation_data = self.generate_simulated_data()
+        """Run trading simulation"""
+        # Reset agent state
+        self.agent.balance = self.agent.initial_balance
+        self.agent.shares = 0
+        self.agent.transaction_history = []
         
-        for i in range(len(simulation_data)):
-            current_date = simulation_data.iloc[i]['Date']
+        # Prepare data
+        sim_data = self.prepare_simulation_data()
+        
+        # Get feature columns
+        feature_columns = ['Close', 'Volume', 'MA5', 'MA10', 'MA20', 'RSI', 
+                          'MACD', 'MACD_signal', 'BB_upper', 'BB_lower', 'Volatility', 'Return']
+        
+        # Run simulation for each trading day
+        for i in range(len(sim_data)):
+            # Get current date and closing price
+            current_date = sim_data.iloc[i]['Date']
+            current_price = sim_data.iloc[i]['Close']
             
-            # Skip if before simulation start date
-            if current_date < self.start_date:
+            # Prepare input data for prediction
+            # Find the historical data up to the current point
+            historical_idx = self.data[self.data['Date'] < current_date].index
+            if len(historical_idx) < self.sequence_length:
+                # Not enough historical data
                 continue
                 
-            # Stop if after simulation end date
-            if current_date > self.end_date:
-                break
-            
-            print(f"\nTrading day: {current_date.strftime('%Y-%m-%d')}")
-            
-            # Get current price
-            current_price = simulation_data.iloc[i]['Open']
-            
-            # Prepare sequence data for model prediction
-            # We need to prepare this from the feature columns
-            feature_data = self.data.iloc[-(self.sequence_length+1):-1]
-            feature_columns = ['Close', 'Volume', 'MA5', 'MA10', 'MA20', 'RSI', 
-                              'MACD', 'MACD_signal', 'BB_upper', 'BB_lower', 'Volatility', 'Return']
+            # Get the most recent sequence_length data points
+            seq_start_idx = historical_idx[-self.sequence_length]
+            seq_data = self.data.loc[seq_start_idx:historical_idx[-1], feature_columns].values
             
             # Scale the data
-            scaled_features = self.agent.scaler.transform(feature_data[feature_columns])
-            scaled_sequence = np.array([scaled_features])
+            scaled_seq = self.agent.scaler.transform(seq_data)
             
-            # Make trading decision (9:00 AM)
-            decision, amount, order = self.agent.make_decision(
-                scaled_sequence, 
-                current_price,
-                next_day=current_date.strftime('%Y-%m-%d')
-            )
+            # Reshape for model input [1, sequence_length, n_features]
+            model_input = scaled_seq.reshape(1, self.sequence_length, len(feature_columns))
             
-            print(f"9:00 AM Decision: {order}")
+            # Make trading decision - pass the complete dataset for YTD analysis
+            decision, amount, order_text = self.agent.make_decision(
+                model_input, current_price, next_day=current_date, available_data=self.data)
             
-            # Execute order at 10:00 AM price
-            execution_price = simulation_data.iloc[i]['Close']
-            executed = self.agent.execute_order(decision, amount, execution_price)
+            # Record decision
+            sim_data.at[sim_data.index[i], 'Decision'] = decision
+            sim_data.at[sim_data.index[i], 'Amount'] = float(amount)  # Ensure float type
             
-            # Record results
-            portfolio_value = self.agent.get_portfolio_value(execution_price)
+            # Execute the order
+            self.agent.execute_order(decision, amount, current_price)
             
-            result = {
-                'date': current_date,
-                'open_price': current_price,
-                'close_price': execution_price,
-                'decision': decision,
-                'amount': amount,
-                'order': order,
-                'executed': executed,
-                'balance': self.agent.balance,
-                'shares': self.agent.shares,
-                'portfolio_value': portfolio_value
-            }
+            # Record portfolio value
+            portfolio_value = self.agent.get_portfolio_value(current_price)
+            sim_data.at[sim_data.index[i], 'Portfolio_Value'] = float(portfolio_value)  # Ensure float type
+            sim_data.at[sim_data.index[i], 'Balance'] = float(self.agent.balance)  # Ensure float type
+            sim_data.at[sim_data.index[i], 'Shares'] = float(self.agent.shares)  # Ensure float type
             
-            self.results.append(result)
-            
-            print(f"10:00 AM Execution Price: ${execution_price:.2f}")
-            print(f"Balance: ${self.agent.balance:.2f}")
-            print(f"Shares: {self.agent.shares}")
-            print(f"Portfolio Value: ${portfolio_value:.2f}")
+            # Make prediction for next day's price and record it
+            if i < len(sim_data) - 1:
+                next_price_prediction = self.agent.predict_price_movement(model_input)
+                
+                # Unscale prediction
+                price_min = self.agent.scaler.data_min_[0]
+                price_max = self.agent.scaler.data_max_[0]
+                predicted_price = next_price_prediction * (price_max - price_min) + price_min
+                
+                sim_data.at[sim_data.index[i+1], 'Predicted'] = float(predicted_price)  # Ensure float type
         
-        return pd.DataFrame(self.results)
-    
-    def plot_results(self, save_path=None):
-        """Plot simulation results"""
-        if not self.results:
-            print("No results to plot. Run simulation first.")
-            return
+        # Store results
+        self.results = sim_data
         
-        results_df = pd.DataFrame(self.results)
-        
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
-        
-        # Plot stock price
-        ax1.plot(results_df['date'], results_df['close_price'], label='Stock Price', color='blue')
-        ax1.set_ylabel('Stock Price ($)')
-        ax1.set_title('Tesla Stock Price During Simulation')
-        ax1.grid(True)
-        
-        # Plot portfolio value
-        ax2.plot(results_df['date'], results_df['portfolio_value'], label='Portfolio Value', color='green')
-        ax2.set_ylabel('Portfolio Value ($)')
-        ax2.set_xlabel('Date')
-        ax2.set_title('Portfolio Value Over Time')
-        ax2.grid(True)
-        
-        # Format x-axis
-        plt.xticks(rotation=45)
-        plt.tight_layout()
-        
-        if save_path:
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            plt.savefig(save_path)
-        
-        plt.show()
+        return sim_data
     
     def get_performance_summary(self):
-        """Generate performance summary"""
-        if not self.results:
-            return "No results available. Run simulation first."
-        
-        results_df = pd.DataFrame(self.results)
-        
+        """Calculate performance metrics"""
+        if self.results is None:
+            raise ValueError("Simulation has not been run yet.")
+            
+        if self.results.empty:
+            return {
+                'initial_balance': self.agent.initial_balance,
+                'final_value': self.agent.initial_balance,
+                'total_return': 0,
+                'return_pct': 0,
+                'transactions': 0,
+                'total_fees': 0,
+                'buys': 0,
+                'sells': 0,
+                'holds': 0,
+                'stock_return_pct': 0,
+                'outperformance_pct': 0
+            }
+            
+        # Get initial and final portfolio values
         initial_value = self.agent.initial_balance
-        final_value = results_df.iloc[-1]['portfolio_value']
-        total_return = (final_value - initial_value) / initial_value * 100
+        final_value = self.results.iloc[-1]['Portfolio_Value']
         
-        summary = {
+        # Calculate returns
+        total_return = final_value - initial_value
+        pct_return = (total_return / initial_value) * 100
+        
+        # Calculate transactions and fees
+        transactions = len(self.agent.transaction_history)
+        total_fees = sum([tx.get('fee', 0) for tx in self.agent.transaction_history])
+        
+        # Calculate buy/sell decisions
+        buys = len([d for d in self.results['Decision'] if d == 'Buy'])
+        sells = len([d for d in self.results['Decision'] if d == 'Sell'])
+        holds = len([d for d in self.results['Decision'] if d == 'Hold'])
+        
+        # Calculate stock performance for comparison
+        if len(self.results) > 1:
+            stock_start_price = self.results.iloc[0]['Close']
+            stock_end_price = self.results.iloc[-1]['Close']
+            stock_return = (stock_end_price - stock_start_price) / stock_start_price * 100
+        else:
+            stock_return = 0
+        
+        # Return performance summary
+        return {
             'initial_balance': initial_value,
-            'final_balance': results_df.iloc[-1]['balance'],
-            'final_shares': results_df.iloc[-1]['shares'],
-            'final_portfolio_value': final_value,
-            'total_return_pct': total_return,
-            'num_trades': len(self.agent.transaction_history),
-            'transaction_fees': sum(t['fee'] for t in self.agent.transaction_history)
+            'final_value': final_value,
+            'total_return': total_return,
+            'return_pct': pct_return,
+            'transactions': transactions,
+            'total_fees': total_fees,
+            'buys': buys,
+            'sells': sells,
+            'holds': holds,
+            'stock_return_pct': stock_return,
+            'outperformance_pct': pct_return - stock_return
         }
+    
+    def plot_results(self, save_path=None, show_plot=True):
+        """Plot simulation results"""
+        if self.results is None:
+            raise ValueError("Simulation has not been run yet.")
         
-        return summary
+        # Use the enhanced visualization function
+        plot_trading_simulation_results(
+            self.results,
+            save_path=save_path,
+            show_plot=show_plot
+        )
+        
+        # Get data for history vs prediction visualization
+        # Historical data is everything before start_date
+        historical_data = self.data[self.data['Date'] < self.start_date].copy()
+        
+        # Prediction data includes both actual and predicted values in the simulation period
+        prediction_data = self.results.copy()
+        
+        # Combine the last point of historical data with prediction data for continuity
+        if not historical_data.empty and not prediction_data.empty:
+            last_historical = historical_data.iloc[[-1]].copy()
+            # Create a separate visualization for historical vs prediction data
+            plot_stock_history_and_prediction(
+                historical_data,
+                prediction_data,
+                save_path=save_path.replace('.png', '_history_vs_prediction.png') if save_path else None,
+                show_plot=show_plot,
+                title='Tesla (TSLA) Stock Price: History and Simulation Period'
+            )

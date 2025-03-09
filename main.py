@@ -1,17 +1,27 @@
 import os
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
 from src.data.preprocess import preprocess_data
-from src.models.lstm_model import StockPredictionModel, train_model
+
+# Import sklearn_model instead of lstm_model
+from src.models.sklearn_model import StockPredictionModel, train_model
 from src.agent.trading_agent import TradingAgent
 from src.evaluation.backtesting import TradingSimulation
+
+# Import new forecast utilities
+from src.utils.date_utils import generate_future_trading_days, get_last_trading_day
+from src.forecasting.price_forecaster import StockForecaster
+
+# Add imports for new features
+from src.evaluation.strategy_comparison import compare_strategies
+from src.visualization.dashboard import create_dashboard
 
 def main():
     # Set paths
     data_path = "data/raw/TSLA.csv"
-    model_path = "models/lstm_model.h5"
+    model_path = "models/sklearn_model.joblib" 
     results_path = "results"
     
     # Create directories if they don't exist
@@ -31,25 +41,56 @@ def main():
         model.load(model_path)
     else:
         print("Training new model...")
-        model = train_model(X_train, y_train, X_test, y_test, sequence_length, X_train.shape[2])
+        model = train_model(X_train, y_train, X_test, y_test, sequence_length, X_train.shape[2], 
+                           model_type='random_forest', save_path=model_path)
     
     # Step 3: Initialize trading agent
     print("Initializing trading agent...")
     agent = TradingAgent(model, scaler)
     
-    # Step 4: Run simulation for March 24-28, 2025
-    print("Running trading simulation...")
-    start_date = datetime(2025, 3, 24)
-    end_date = datetime(2025, 3, 28)
-    simulation = TradingSimulation(agent, processed_data, sequence_length, start_date, end_date)
+    # Step 4: Generate next 5 trading days dates
+    print("Generating forecast for next 5 trading days...")
+    last_trading_day = get_last_trading_day()
+    future_dates = generate_future_trading_days(last_trading_day, 5)
     
+    print(f"Last trading day: {last_trading_day.strftime('%Y-%m-%d')}")
+    print(f"Future trading days: {[d.strftime('%Y-%m-%d') for d in future_dates]}")
+    
+    # Step 5: Create forecaster and generate future data
+    feature_columns = ['Close', 'Volume', 'MA5', 'MA10', 'MA20', 'RSI', 
+                      'MACD', 'MACD_signal', 'BB_upper', 'BB_lower', 'Volatility', 'Return']
+    
+    forecaster = StockForecaster(model, scaler, sequence_length, feature_columns)
+    
+    # Add is_forecast flag to processed data
+    processed_data['is_forecast'] = False
+    
+    # Generate forecast data
+    forecast_data = forecaster.forecast_next_days(processed_data, future_dates)
+    
+    # Combine historical and forecast data
+    combined_data = pd.concat([processed_data, forecast_data], ignore_index=True)
+    
+    # Step 6: Run simulation for future dates
+    print("Running trading simulation for future dates...")
+    start_date = future_dates[0]
+    end_date = future_dates[-1]
+    
+    print(f"Simulation period: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+    
+    simulation = TradingSimulation(agent, combined_data, sequence_length, start_date, end_date)
     results = simulation.run_simulation()
     
-    # Step 5: Visualize and save results
+    # Make sure we have valid results before continuing
+    if results.empty:
+        print("Error: No data available for simulation in the selected date range.")
+        return
+    
+    # Step 7: Visualize and save results
     print("Generating performance summary...")
     performance = simulation.get_performance_summary()
     
-    print("\n===== Performance Summary =====")
+    print("\n===== Performance Summary (FORECAST) =====")
     for key, value in performance.items():
         if 'pct' in key:
             print(f"{key}: {value:.2f}%")
@@ -59,13 +100,35 @@ def main():
             print(f"{key}: {value}")
     
     # Save results
-    results.to_csv(os.path.join(results_path, "simulation_results.csv"), index=False)
+    results.to_csv(os.path.join(results_path, "forecast_results.csv"), index=False)
     
     # Plot results
     print("Plotting results...")
-    simulation.plot_results(save_path=os.path.join(results_path, "simulation_plot.png"))
+    simulation.plot_results(save_path=os.path.join(results_path, "forecast_plot.png"))
     
-    print("\nSimulation complete!")
+    # After running simulation and plotting results:
+    
+    # Create strategy comparison
+    print("\nComparing trading strategies...")
+    historical_data = processed_data[processed_data['is_forecast'] == False].copy()
+    strategy_results, strategy_performance = compare_strategies(
+        historical_data, 
+        forecast_data,
+        agent_results=results,
+        save_path=os.path.join(results_path, "strategy_comparison.png")
+    )
+    
+    # Create comprehensive dashboard
+    print("\nGenerating dashboard...")
+    create_dashboard(
+        historical_data.tail(30),  # Last 30 days of historical data
+        forecast_data,
+        results,
+        performance,
+        save_path=os.path.join(results_path, "dashboard.png")
+    )
+    
+    print("\nAll visualizations and comparisons complete!")
     
 if __name__ == "__main__":
     main()
