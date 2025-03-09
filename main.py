@@ -24,7 +24,7 @@ def main():
     # Change model path to sklearn_model.joblib
     # model_path = "models/sklearn_model.joblib"
     # Change model path to advanced_model.joblib
-    model_path = "models/advanced_model.joblib" 
+    model_path = "models/advanced_model.joblib"
     results_path = "results"
     
     # Create directories if they don't exist
