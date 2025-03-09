@@ -21,6 +21,9 @@ from src.visualization.dashboard import create_dashboard
 def main():
     # Set paths
     data_path = "data/raw/TSLA.csv"
+    # Change model path to sklearn_model.joblib
+    # model_path = "models/sklearn_model.joblib"
+    # Change model path to advanced_model.joblib
     model_path = "models/advanced_model.joblib" 
     results_path = "results"
     
