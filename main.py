@@ -17,13 +17,11 @@ from src.forecasting.price_forecaster import StockForecaster
 # Add imports for new features
 from src.evaluation.strategy_comparison import compare_strategies
 from src.visualization.dashboard import create_dashboard
+from src.debug.test_direction_prediction import test_direction_prediction_accuracy
 
 def main():
     # Set paths
     data_path = "data/raw/TSLA.csv"
-    # Change model path to sklearn_model.joblib
-    # model_path = "models/sklearn_model.joblib"
-    # Change model path to advanced_model.joblib
     model_path = "models/advanced_model.joblib"
     results_path = "results"
     
@@ -37,15 +35,25 @@ def main():
     X_train, X_test, y_train, y_test, scaler, processed_data = preprocess_data(data_path, sequence_length)
     
     # Step 2: Train or load model
-    print("Training model...")
+    print("Loading model...")
     if os.path.exists(model_path):
         print(f"Loading existing model from {model_path}")
         model = StockPredictionModel(sequence_length, X_train.shape[2])
         model.load(model_path)
+        
+        # Check if model has direction classifier
+        has_direction_classifier = hasattr(model, 'direction_classifier') and model.direction_classifier is not None
+        if has_direction_classifier:
+            print(f"Model includes direction classifier (version: {getattr(model, 'direction_classifier_version', 'unknown')})")
+        else:
+            print("Model does not have a direction classifier")
     else:
-        print("Training new model...")
-        model = train_model(X_train, y_train, X_test, y_test, sequence_length, X_train.shape[2], 
-                           model_type='random_forest', save_path=model_path)
+        print("Model not found. Please train a model first using train_advanced_model.py or train_direction_focused_model.py")
+        print("Example: python src/models/train_direction_focused_model.py --epochs 20 --direction-focus")
+        return
+    
+    # Test direction prediction accuracy (optional - uncomment to run)
+    # test_direction_prediction_accuracy(model_path)
     
     # Step 3: Initialize trading agent
     print("Initializing trading agent...")

@@ -4,11 +4,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 import joblib
 from datetime import datetime
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, VotingRegressor
-from sklearn.linear_model import Ridge
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, VotingRegressor, RandomForestClassifier
+from sklearn.linear_model import Ridge, LogisticRegression
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
+from sklearn.preprocessing import StandardScaler
+from imblearn.over_sampling import SMOTE
 
 class ModelTrainer:
     def __init__(self, sequence_length, n_features, model_dir="models", logs_dir="logs"):
@@ -27,6 +29,8 @@ class ModelTrainer:
         self.logs_dir = logs_dir
         self.models = {}
         self.ensemble = None
+        self.direction_classifier = None  # Added for direction prediction
+        self.direction_classifier_version = 0  # Track version for changes
         self.history = {
             'train_scores': [],
             'val_scores': [],
@@ -103,6 +107,205 @@ class ModelTrainer:
         
         return metrics
     
+    def create_direction_features(self, X, y=None, y_prev=None):
+        """
+        Create specialized features for direction prediction
+        These features focus on patterns relevant to price movement direction
+        
+        Parameters:
+        - X: Input features (2D array)
+        - y: Target values (optional)
+        - y_prev: Previous price values (optional)
+        
+        Returns:
+        - Enhanced feature array with direction-specific features
+        """
+        # Start with original features
+        X_enhanced = X.copy()
+        
+        # Get number of samples and features
+        n_samples = X.shape[0]
+        
+        # Calculate feature differences (momentum indicators)
+        # For sequence data that has been flattened, we need to be careful with the feature positions
+        n_features = self.n_features  # Original number of features per time step
+        seq_length = self.sequence_length  # Number of time steps in a sequence
+        
+        # For flattened sequence data, the shape is (samples, sequence_length * n_features)
+        # Each time step's features are grouped together
+        
+        # Add momentum-based features (difference between current and previous time steps)
+        dir_features = []
+        
+        # For each sample
+        for i in range(n_samples):
+            sample_features = []
+            
+            # Extract the closing prices across the sequence
+            # Assuming close price is the first feature in each time step
+            close_prices = np.array([X[i, j*n_features] for j in range(seq_length)])
+            
+            # Calculate price differences between consecutive time steps
+            price_diffs = np.diff(close_prices)
+            
+            # Calculate direction changes and streaks
+            directions = np.sign(price_diffs)
+            direction_changes = np.diff(directions)
+            
+            # Calculate other momentum indicators
+            roc = (close_prices[-1] / close_prices[0] - 1) * 100  # Rate of change
+            momentum = np.sum(directions)  # Sum of directions (positive = uptrend)
+            volatility = np.std(price_diffs)  # Volatility
+            
+            # Add these as features
+            sample_features.extend([
+                roc,                             # Rate of change
+                momentum,                        # Momentum score
+                volatility,                      # Volatility
+                np.count_nonzero(directions > 0),  # Number of up moves
+                np.count_nonzero(directions < 0),  # Number of down moves
+                np.max(np.where(directions > 0)[0]) if np.any(directions > 0) else 0,  # Position of last up move
+                np.max(np.where(directions < 0)[0]) if np.any(directions < 0) else 0,  # Position of last down move
+            ])
+            
+            # Add strength of last few moves
+            sample_features.extend(price_diffs[-3:])  # Last 3 price differences
+            
+            dir_features.append(sample_features)
+        
+        # Convert to numpy array
+        dir_features = np.array(dir_features)
+        
+        # Create enhanced feature set by combining original and new features
+        X_with_dir_features = np.hstack([X, dir_features])
+        
+        return X_with_dir_features
+            
+    def _prepare_direction_data(self, X, y, y_prev=None):
+        """
+        Prepare data for training direction classifier
+        
+        Returns:
+        - X_enhanced: Enhanced input features for direction prediction
+        - y_direction: Binary labels (1=price up, 0=price down/same)
+        """
+        # Create previous price vector if not provided
+        if y_prev is None:
+            y_prev = np.roll(y, 1)
+            y_prev[0] = y[0]
+            
+        # Create direction labels: 1 if price went up, 0 if price went down/stayed same
+        y_direction = (y > y_prev).astype(int)
+        
+        # Create enhanced features specifically for direction prediction
+        X_enhanced = self.create_direction_features(X, y, y_prev)
+        
+        return X_enhanced, y_direction
+
+    def train_direction_classifier(self, X_train, y_train, X_val=None, y_val=None, iteration=0):
+        """Train a dedicated model for price direction prediction"""
+        print("\nTraining dedicated direction classifier...")
+        
+        # Prepare training data for direction prediction
+        # Get previous values from the training set (shifted by 1)
+        y_train_prev = np.roll(y_train, 1)
+        y_train_prev[0] = y_train[0]  # First value uses itself as previous
+        
+        # Create binary labels and enhanced features
+        X_train_dir, y_train_dir = self._prepare_direction_data(X_train, y_train, y_train_prev)
+        
+        # Prepare validation data if provided
+        if X_val is not None and y_val is not None:
+            y_val_prev = np.roll(y_val, 1)
+            y_val_prev[0] = y_train[-1]  # First validation value uses last training value as previous
+            X_val_dir, y_val_dir = self._prepare_direction_data(X_val, y_val, y_val_prev)
+        else:
+            X_val_dir, y_val_dir = None, None
+        
+        # Check class balance and print info
+        class_counts = np.bincount(y_train_dir)
+        print(f"Direction class distribution - Up: {class_counts[1]} ({class_counts[1]/len(y_train_dir):.2%}), " 
+              f"Down/Same: {class_counts[0]} ({class_counts[0]/len(y_train_dir):.2%})")
+        
+        # Create classifier based on iteration to introduce variation
+        if iteration % 3 == 0:
+            print("Using RandomForest for direction classifier")
+            # Use more trees and different parameters for later iterations
+            n_estimators = 100 + (iteration // 3) * 50  # Increase estimators over time
+            max_depth = None if iteration < 10 else (10 + iteration // 2)
+            
+            classifier = RandomForestClassifier(
+                n_estimators=min(n_estimators, 300),  # Cap at 300 trees
+                max_depth=max_depth,
+                class_weight='balanced',
+                random_state=42+iteration  # Use different random state for diversity
+            )
+        elif iteration % 3 == 1:
+            print("Using GradientBoosting for direction classifier")
+            classifier = GradientBoostingClassifier(
+                n_estimators=100,
+                learning_rate=0.1,
+                max_depth=3,
+                random_state=42+iteration
+            )
+        else:
+            print("Using LogisticRegression for direction classifier")
+            classifier = LogisticRegression(
+                class_weight='balanced',
+                max_iter=1000,
+                C=0.1 * (2 ** (iteration // 5)),  # Vary regularization over iterations
+                random_state=42+iteration
+            )
+        
+        # Apply data balancing for class imbalance
+        if iteration % 2 == 0 and class_counts[0] / len(y_train_dir) > 0.65 or class_counts[1] / len(y_train_dir) > 0.65:
+            print("Applying SMOTE to balance classes...")
+            try:
+                smote = SMOTE(random_state=42+iteration)
+                X_train_dir_resampled, y_train_dir_resampled = smote.fit_resample(X_train_dir, y_train_dir)
+                print(f"Data shape after SMOTE: {X_train_dir_resampled.shape}, y: {np.bincount(y_train_dir_resampled)}")
+                
+                # Train on resampled data
+                classifier.fit(X_train_dir_resampled, y_train_dir_resampled)
+            except Exception as e:
+                print(f"SMOTE failed: {e}. Training on original data.")
+                classifier.fit(X_train_dir, y_train_dir)
+        else:
+            # Train on original data
+            classifier.fit(X_train_dir, y_train_dir)
+        
+        # Evaluate on training data
+        train_pred_dir = classifier.predict(X_train_dir)
+        train_acc = accuracy_score(y_train_dir, train_pred_dir)
+        train_f1 = f1_score(y_train_dir, train_pred_dir)
+        
+        print(f"Direction classifier - Training accuracy: {train_acc:.4f}, F1: {train_f1:.4f}")
+        
+        # Evaluate on validation data if provided
+        if X_val_dir is not None and y_val_dir is not None:
+            val_pred_dir = classifier.predict(X_val_dir)
+            val_acc = accuracy_score(y_val_dir, val_pred_dir)
+            val_f1 = f1_score(y_val_dir, val_pred_dir)
+            val_precision = precision_score(y_val_dir, val_pred_dir)
+            val_recall = recall_score(y_val_dir, val_pred_dir)
+            
+            # Try to get probability predictions for AUC if supported
+            try:
+                val_proba = classifier.predict_proba(X_val_dir)[:, 1]
+                val_auc = roc_auc_score(y_val_dir, val_proba)
+                print(f"Direction classifier - Validation AUC: {val_auc:.4f}")
+            except:
+                val_auc = 0
+                
+            print(f"Direction classifier - Validation metrics: Accuracy={val_acc:.4f}, F1={val_f1:.4f}, "
+                  f"Precision={val_precision:.4f}, Recall={val_recall:.4f}")
+        
+        # Store the trained classifier and increment version
+        self.direction_classifier = classifier
+        self.direction_classifier_version += 1
+        
+        return classifier
+        
     def train_epoch(self, X_train, y_train, X_val, y_val, epoch, param_grid=None):
         """Train one epoch with hyperparameter tuning and model selection"""
         print(f"\nTraining Epoch {epoch+1}")
@@ -221,6 +424,25 @@ class ModelTrainer:
         })
         self.history['best_params'].append(best_params)
         
+        # Train direction classifier with increasing frequency in later epochs
+        # Early epochs: train every 5 epochs
+        # Later epochs: train more frequently to refine the classifier
+        train_classifier = False
+        if epoch < 10:
+            train_classifier = epoch % 5 == 0
+        elif epoch < 30:
+            train_classifier = epoch % 3 == 0
+        else:
+            train_classifier = epoch % 2 == 0
+            
+        if train_classifier:
+            # Reshape data for sklearn if needed
+            X_train_2d = self.reshape_data(X_train)
+            X_val_2d = self.reshape_data(X_val)
+            
+            # Train direction classifier with current epoch number for variety
+            self.train_direction_classifier(X_train_2d, y_train, X_val_2d, y_val, iteration=epoch)
+        
         # Save models for this epoch
         self.save_models(epoch)
         
@@ -228,7 +450,8 @@ class ModelTrainer:
             'ensemble_mse': ensemble_val_mse,
             'ensemble_r2': ensemble_val_r2,
             'classification_metrics': class_metrics,
-            'models': epoch_results
+            'models': epoch_results,
+            'direction_classifier_version': self.direction_classifier_version
         }
     
     def train(self, X_train, y_train, X_val, y_val, epochs=100, param_grid=None, notes=""):
@@ -321,6 +544,11 @@ class ModelTrainer:
         ensemble_path = os.path.join(epoch_dir, "ensemble_model.joblib")
         joblib.dump(self.ensemble, ensemble_path)
         
+        # Save direction classifier if it exists
+        if self.direction_classifier is not None:
+            dir_classifier_path = os.path.join(epoch_dir, "direction_classifier.joblib")
+            joblib.dump(self.direction_classifier, dir_classifier_path)
+        
         # Save metadata
         metadata = {
             'sequence_length': self.sequence_length,
@@ -372,6 +600,11 @@ class ModelTrainer:
         if os.path.exists(ensemble_path):
             self.ensemble = joblib.load(ensemble_path)
         
+        # Load direction classifier if it exists
+        dir_classifier_path = os.path.join(epoch_dir, "direction_classifier.joblib")
+        if os.path.exists(dir_classifier_path):
+            self.direction_classifier = joblib.load(dir_classifier_path)
+        
         # Load history
         history_path = os.path.join(self.logs_dir, "training_history.joblib")
         if os.path.exists(history_path):
@@ -402,6 +635,7 @@ class ModelTrainer:
             'recall': class_metrics['recall'],
             'f1_score': class_metrics['f1'],
             'training_time': str(training_time),
+            'direction_classifier_version': self.direction_classifier_version,
             'notes': notes
         }
         
@@ -517,9 +751,102 @@ class ModelTrainer:
         # Set the model to our trained ensemble
         model.model = self.ensemble
         
-        # Save the model
-        model.save(output_path)
+        # Add the direction classifier and version
+        model.direction_classifier = self.direction_classifier
+        model.direction_classifier_version = self.direction_classifier_version
         
-        print(f"Exported stock prediction model to {output_path}")
+        # Embed the direction feature creation function in the model
+        def create_direction_features(self, X):
+            """Create direction-specific features for prediction"""
+            # Start with original features
+            X_copy = X.reshape(X.shape[0], -1) if len(X.shape) > 2 else X.copy()
+            
+            # Get number of samples
+            n_samples = X_copy.shape[0]
+            
+            # Calculate feature differences (momentum indicators)
+            n_features = self.n_features
+            seq_length = self.sequence_length
+            
+            # Add momentum-based features (difference between current and previous time steps)
+            dir_features = []
+            
+            # For each sample
+            for i in range(n_samples):
+                sample_features = []
+                
+                # Extract the closing prices across the sequence
+                close_prices = np.array([X_copy[i, j*n_features] for j in range(seq_length)])
+                
+                # Calculate price differences between consecutive time steps
+                price_diffs = np.diff(close_prices)
+                
+                # Calculate direction changes and streaks
+                directions = np.sign(price_diffs)
+                
+                # Calculate other momentum indicators
+                roc = (close_prices[-1] / close_prices[0] - 1) * 100
+                momentum = np.sum(directions)
+                volatility = np.std(price_diffs)
+                
+                # Add these as features
+                sample_features.extend([
+                    roc,                             # Rate of change
+                    momentum,                        # Momentum score
+                    volatility,                      # Volatility
+                    np.count_nonzero(directions > 0),  # Number of up moves
+                    np.count_nonzero(directions < 0),  # Number of down moves
+                    np.max(np.where(directions > 0)[0]) if np.any(directions > 0) else 0,
+                    np.max(np.where(directions < 0)[0]) if np.any(directions < 0) else 0,
+                ])
+                
+                # Add strength of last few moves
+                sample_features.extend(price_diffs[-3:])  # Last 3 price differences
+                
+                dir_features.append(sample_features)
+            
+            # Convert to numpy array and combine with original features
+            dir_features = np.array(dir_features)
+            X_with_dir_features = np.hstack([X_copy, dir_features])
+            
+            return X_with_dir_features
+        
+        # Add the method to the model instance
+        model.create_direction_features = create_direction_features.__get__(model)
+        
+        # Override predict_direction to use enhanced features
+        def predict_direction(self, X):
+            """Predict price movement direction (1=up, 0=down)"""
+            X_reshaped = X.reshape(X.shape[0], -1) if len(X.shape) > 2 else X
+            
+            if hasattr(self, 'direction_classifier') and self.direction_classifier is not None:
+                # Create enhanced features for direction prediction
+                X_enhanced = self.create_direction_features(X_reshaped)
+                return self.direction_classifier.predict(X_enhanced)
+            else:
+                # Fall back to deriving direction from regression prediction
+                y_pred = self.predict(X)
+                return (y_pred > 0.5).astype(int)
+        
+        # Add the method to the model instance
+        model.predict_direction = predict_direction.__get__(model)
+        
+        # Save the model with all enhancements
+        model_data = {
+            'model': model.model,
+            'sequence_length': model.sequence_length,
+            'n_features': model.n_features,
+            'model_type': model.model_type,
+            'direction_classifier': self.direction_classifier,
+            'direction_classifier_version': self.direction_classifier_version
+        }
+        
+        # Save with joblib
+        model_dir = os.path.dirname(output_path)
+        os.makedirs(model_dir, exist_ok=True)
+        joblib.dump(model_data, output_path)
+        
+        print(f"Exported stock prediction model to {output_path} with direction classifier version {self.direction_classifier_version}")
         
         return model
+``` 

@@ -15,16 +15,21 @@ class StockPredictionModel:
         Parameters:
         - sequence_length: Length of input sequences 
         - n_features: Number of features
-        - model_type: 'random_forest' or 'ridge'
+        - model_type: 'random_forest', 'ridge', or 'ensemble'
         """
         self.sequence_length = sequence_length
         self.n_features = n_features
         self.model_type = model_type
+        self.direction_classifier = None  # Added for direction prediction
+        self.direction_classifier_version = 0  # Track version for model quality
         
         if model_type == 'random_forest':
             self.model = RandomForestRegressor(n_estimators=100, random_state=42)
-        else:
+        elif model_type == 'ridge':
             self.model = Ridge(alpha=1.0)
+        else:
+            # For ensemble or other types, model will be set later
+            self.model = None
             
     def predict(self, X):
         """
@@ -46,6 +51,34 @@ class StockPredictionModel:
         # Return as 2D array to match TensorFlow model output format
         return y_pred.reshape(-1, 1)
     
+    def create_direction_features(self, X):
+        """Create direction-specific features for prediction"""
+        # This is a stub - will be replaced when loading from ModelTrainer
+        X_reshaped = X.reshape(X.shape[0], -1) if len(X.shape) > 2 else X
+        return X_reshaped
+    
+    def predict_direction(self, X):
+        """
+        Predict price movement direction
+        
+        Parameters:
+        - X: Input data
+        
+        Returns:
+        - 1 for price up, 0 for price down or same
+        """
+        X_reshaped = X.reshape(X.shape[0], -1) if len(X.shape) > 2 else X
+        
+        if hasattr(self, 'direction_classifier') and self.direction_classifier is not None:
+            # Create enhanced features for direction prediction
+            X_enhanced = self.create_direction_features(X_reshaped)
+            return self.direction_classifier.predict(X_enhanced)
+        else:
+            # Fall back to deriving direction from regression prediction
+            y_pred = self.predict(X)
+            # We have no previous value here, so we assume up if prediction is above 0.5
+            return (y_pred > 0.5).astype(int)
+    
     def save(self, filepath):
         """Save the model to disk"""
         model_dir = os.path.dirname(filepath)
@@ -56,7 +89,9 @@ class StockPredictionModel:
             'model': self.model,
             'sequence_length': self.sequence_length,
             'n_features': self.n_features,
-            'model_type': self.model_type
+            'model_type': self.model_type,
+            'direction_classifier': self.direction_classifier,
+            'direction_classifier_version': getattr(self, 'direction_classifier_version', 0)
         }
         
         # Save with joblib
@@ -74,7 +109,15 @@ class StockPredictionModel:
         self.n_features = model_data['n_features']
         self.model_type = model_data['model_type']
         
-        print(f"Model loaded from {filepath}")
+        # Load direction classifier if available
+        if 'direction_classifier' in model_data:
+            self.direction_classifier = model_data['direction_classifier']
+        
+        # Load direction classifier version if available
+        if 'direction_classifier_version' in model_data:
+            self.direction_classifier_version = model_data['direction_classifier_version']
+        
+        print(f"Model loaded from {filepath} with direction classifier version {getattr(self, 'direction_classifier_version', 0)}")
 
 
 def train_model(X_train, y_train, X_test, y_test, sequence_length, n_features, 

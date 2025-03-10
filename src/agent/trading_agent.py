@@ -29,6 +29,26 @@ class TradingAgent:
         prediction = self.model.predict(current_data)
         return prediction[0][0]  # Get first prediction
         
+    def predict_price_direction(self, current_data):
+        """Predict price direction (up=1, down=0) using the model"""
+        if hasattr(self.model, 'predict_direction'):
+            direction = self.model.predict_direction(current_data)
+            return direction[0]  # Get first prediction
+        else:
+            # Fall back to deriving direction from price prediction
+            prediction = self.predict_price_movement(current_data)
+            
+            # Unscale the predicted price
+            price_min = self.scaler.data_min_[0]
+            price_max = self.scaler.data_max_[0]
+            predicted_price = prediction * (price_max - price_min) + price_min
+            
+            # Get current price from the input data
+            current_price = current_data[0, -1, 0]  # Last time step, first feature
+            current_price = current_price * (price_max - price_min) + price_min
+            
+            return 1 if predicted_price > current_price else 0
+    
     def calculate_risk_factor(self, data, ytd_data=None):
         """Calculate risk factor based on volatility and other metrics, emphasizing YTD data"""
         # Get volatility and RSI from current data
@@ -123,7 +143,7 @@ class TradingAgent:
     
     def make_decision(self, current_data, current_price, next_day=None, available_data=None):
         """
-        Make trading decision emphasizing YTD data
+        Make trading decision emphasizing YTD data and direction prediction
         
         Parameters:
         - current_data: Current market data for prediction
@@ -151,6 +171,10 @@ class TradingAgent:
         # Calculate price change percentage
         price_change_pct = (predicted_price - current_price) / current_price
         
+        # Get direction prediction (1=up, 0=down)
+        direction_prediction = self.predict_price_direction(current_data)
+        direction_confidence = 0.7  # Default confidence, replace with probability if available
+        
         # YTD analysis if data is available
         ytd_metrics = {}
         if available_data is not None and next_day is not None:
@@ -166,11 +190,11 @@ class TradingAgent:
             prediction_momentum = sum([1 if self.previous_predictions[i] > self.previous_predictions[i-1] else -1 
                                     for i in range(1, len(self.previous_predictions))])
         
-        # Decision logic with YTD emphasis
+        # Decision logic with YTD emphasis and direction prediction
         decision = "Hold"
         amount = 0
         
-        # Buy signals - prioritize YTD metrics if available
+        # Strongly weight direction prediction in buy/sell decisions
         if ytd_metrics:
             # Strong YTD buy signals
             ytd_buy_signal = (
@@ -185,11 +209,12 @@ class TradingAgent:
                 (ytd_metrics.get('volatility_trend', 0) > 0.1)    # Increasing volatility
             )
             
-            # If YTD signals suggest buying and short-term prediction agrees
-            if ytd_buy_signal and price_change_pct > 0 and not ytd_caution:
+            # If YTD signals suggest buying AND direction prediction is up
+            if (ytd_buy_signal or direction_prediction == 1) and price_change_pct > 0 and not ytd_caution:
                 decision = "Buy"
-                # Calculate position size based on YTD metrics and risk
-                confidence = min(1.0, abs(ytd_metrics.get('price_momentum', 0) * 10))
+                # Calculate position size based on YTD metrics, risk and direction confidence
+                confidence = min(1.0, abs(ytd_metrics.get('price_momentum', 0) * 10) + direction_confidence)
+                # Slightly lower threshold to trigger more buys
                 amount = self.balance * risk_factor * confidence
                 # Ensure minimum transaction
                 if amount < 50:
@@ -202,26 +227,33 @@ class TradingAgent:
                 (ytd_metrics.get('rsi', 50) > 75)                  # Overbought
             )
             
-            if ytd_sell_signal and self.shares > 0 and (price_change_pct < 0 or ytd_metrics.get('rsi', 50) > 70):
+            if (ytd_sell_signal or direction_prediction == 0) and self.shares > 0 and (price_change_pct < 0 or ytd_metrics.get('rsi', 50) > 70):
                 decision = "Sell"
                 # Sell ratio based on YTD metrics
                 sell_ratio = min(1.0, abs(ytd_metrics.get('price_momentum', 0) * 15))
                 amount = max(1, int(self.shares * sell_ratio))
         else:
             # Fallback to basic signals when YTD data isn't available
-            if price_change_pct > 0.005 or (prediction_momentum > 1 and price_change_pct > 0):
+            # More aggressively use direction prediction here
+            if direction_prediction == 1 or (prediction_momentum > 1 and price_change_pct > 0):
                 decision = "Buy"
-                amount = self.balance * risk_factor * (1 + abs(price_change_pct) * 5)
-                if amount < 50:
-                    amount = 50
+                confidence = 0.5 if direction_prediction == 1 else 0.3
+                amount = self.balance * risk_factor * confidence * (1 + abs(price_change_pct) * 5)
+                # Lower minimum to trigger more buys
+                if amount < 20:
+                    amount = 20
             
-            elif (price_change_pct < -0.005 or (prediction_momentum < -1 and price_change_pct < 0)) and self.shares > 0:
+            elif (direction_prediction == 0 or prediction_momentum < -1) and self.shares > 0:
                 decision = "Sell"
-                sell_ratio = min(1.0, abs(price_change_pct * 30))
+                sell_ratio = 0.5 if direction_prediction == 0 else 0.3
                 amount = max(1, int(self.shares * sell_ratio))
         
         # Format the order
         order = self._format_order(decision, amount, current_price, next_day)
+        
+        # Debug logging to diagnose trading issues
+        print(f"Decision: {decision}, Direction: {'UP' if direction_prediction == 1 else 'DOWN'}, "
+              f"Price change: {price_change_pct:.2%}, Amount: {amount:.2f}")
         
         return decision, amount, order
     
