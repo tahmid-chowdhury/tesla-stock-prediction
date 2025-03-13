@@ -34,27 +34,45 @@ class Preprocessor:
         
     def add_technical_indicators(self, df):
         """
-        Add technical indicators to the dataframe
+        Add enhanced technical indicators to the dataframe
         """
         # Make a copy to avoid SettingWithCopyWarning
         df = df.copy()
         
-        # Ensure close price is 1-dimensional
+        # Ensure price and volume data are 1-dimensional
         close_series = df['Close'].squeeze() if hasattr(df['Close'], 'squeeze') else df['Close']
+        high_series = df['High'].squeeze() if hasattr(df['High'], 'squeeze') else df['High']
+        low_series = df['Low'].squeeze() if hasattr(df['Low'], 'squeeze') else df['Low']
+        open_series = df['Open'].squeeze() if hasattr(df['Open'], 'squeeze') else df['Open']
+        volume_series = df['Volume'].squeeze() if hasattr(df['Volume'], 'squeeze') else df['Volume']
         
-        # Calculate basic indicators
+        # Basic indicators
         df['MA_5'] = ta.trend.sma_indicator(close_series, window=5)
         df['MA_10'] = ta.trend.sma_indicator(close_series, window=10)
         df['MA_20'] = ta.trend.sma_indicator(close_series, window=20)
+        df['MA_50'] = ta.trend.sma_indicator(close_series, window=50)
+        df['MA_200'] = ta.trend.sma_indicator(close_series, window=200)
         
-        # RSI
+        # Exponential moving averages
+        df['EMA_5'] = ta.trend.ema_indicator(close_series, window=5)
+        df['EMA_10'] = ta.trend.ema_indicator(close_series, window=10)
+        df['EMA_20'] = ta.trend.ema_indicator(close_series, window=20)
+        
+        # Moving average crossovers (as binary signals)
+        df['MA_5_10_cross'] = (df['MA_5'] > df['MA_10']).astype(float)
+        df['MA_10_20_cross'] = (df['MA_10'] > df['MA_20']).astype(float)
+        
+        # RSI with different periods
         df['RSI'] = ta.momentum.rsi(close_series, window=14)
+        df['RSI_7'] = ta.momentum.rsi(close_series, window=7)
+        df['RSI_21'] = ta.momentum.rsi(close_series, window=21)
         
         # MACD
         macd = ta.trend.MACD(close_series)
         df['MACD'] = macd.macd()
         df['MACD_signal'] = macd.macd_signal()
         df['MACD_diff'] = macd.macd_diff()
+        df['MACD_cross'] = (df['MACD'] > df['MACD_signal']).astype(float)
         
         # Bollinger Bands
         bollinger = ta.volatility.BollingerBands(close_series)
@@ -63,16 +81,52 @@ class Preprocessor:
         df['BB_mid'] = bollinger.bollinger_mavg()
         df['BB_width'] = (df['BB_high'] - df['BB_low']) / df['BB_mid']
         
-        # Volume indicators - ensure volume is also 1-dimensional
-        volume_series = df['Volume'].squeeze() if hasattr(df['Volume'], 'squeeze') else df['Volume']
+        # Price position within Bollinger Bands (normalized 0-1)
+        df['BB_position'] = (close_series - df['BB_low']) / (df['BB_high'] - df['BB_low'])
+        
+        # ATR - Average True Range (volatility indicator)
+        df['ATR'] = ta.volatility.average_true_range(high_series, low_series, close_series, window=14)
+        
+        # Parabolic SAR
+        df['PSAR'] = ta.trend.psar_down(high_series, low_series, close_series)
+        
+        # ADX - Average Directional Index
+        df['ADX'] = ta.trend.adx(high_series, low_series, close_series, window=14)
+        df['ADX_pos'] = ta.trend.adx_pos(high_series, low_series, close_series, window=14)
+        df['ADX_neg'] = ta.trend.adx_neg(high_series, low_series, close_series, window=14)
+        
+        # Stochastic Oscillator
+        stoch = ta.momentum.StochasticOscillator(high_series, low_series, close_series)
+        df['STOCH_k'] = stoch.stoch()
+        df['STOCH_d'] = stoch.stoch_signal()
+        
+        # Chaikin Money Flow
+        df['CMF'] = ta.volume.chaikin_money_flow(high_series, low_series, close_series, volume_series)
+        
+        # On-balance volume
         df['OBV'] = ta.volume.on_balance_volume(close_series, volume_series)
         
-        # Price transformation
+        # Volume indicators
+        df['VPT'] = ta.volume.volume_price_trend(close_series, volume_series)
+        
+        # Price transformations
         df['log_return'] = np.log(close_series / close_series.shift(1))
         df['pct_change'] = close_series.pct_change()
         
-        # Volatility
-        df['volatility'] = df['log_return'].rolling(window=20).std()
+        # Volatility (standard deviation of log returns)
+        df['volatility_7'] = df['log_return'].rolling(window=7).std()
+        df['volatility_14'] = df['log_return'].rolling(window=14).std()
+        df['volatility_30'] = df['log_return'].rolling(window=30).std()
+        
+        # Price to moving average ratios
+        df['price_to_MA50'] = close_series / df['MA_50']
+        df['price_to_MA200'] = close_series / df['MA_200']
+        
+        # Candlestick patterns - binary features
+        df['doji'] = ((abs(open_series - close_series) / (high_series - low_series)) < 0.1).astype(float)
+        df['hammer'] = ((high_series - low_series > 3 * (open_series - close_series)) & 
+                       (close_series > open_series) & 
+                       ((close_series - low_series) / (.001 + high_series - low_series) > 0.6)).astype(float)
         
         # Drop NaN values resulting from indicators
         df = df.dropna()

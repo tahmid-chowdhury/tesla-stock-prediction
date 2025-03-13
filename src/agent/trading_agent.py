@@ -8,7 +8,8 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class TradingAgent:
-    def __init__(self, model, price_scaler, initial_capital=10000, transaction_fee=0.01, risk_factor=0.3):
+    def __init__(self, model, price_scaler, initial_capital=10000, transaction_fee=0.01, risk_factor=0.3,
+                 stop_loss_pct=5.0, trailing_stop_pct=None):
         """
         Initialize the trading agent
         
@@ -18,17 +19,25 @@ class TradingAgent:
             initial_capital: Initial investment amount
             transaction_fee: Fee per transaction (as a percentage)
             risk_factor: Risk factor for position sizing (0.1-0.5)
+            stop_loss_pct: Stop loss percentage (e.g., 5.0 means sell if price drops 5% from purchase)
+            trailing_stop_pct: Trailing stop percentage (adjust stop loss as price increases)
         """
         self.model = model
         self.price_scaler = price_scaler
         self.initial_capital = initial_capital
         self.current_capital = initial_capital
         self.transaction_fee = transaction_fee
-        self.risk_factor = risk_factor  # Add risk factor parameter
+        self.risk_factor = risk_factor
+        self.stop_loss_pct = stop_loss_pct
+        self.trailing_stop_pct = trailing_stop_pct
         self.shares_owned = 0
         self.transaction_history = []
         self.portfolio_history = []
         self.results_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "results")
+        
+        # Stop loss tracking variables
+        self.purchase_price = 0  # Price at which shares were purchased
+        self.highest_price_since_purchase = 0  # For trailing stop loss
         
         # Create results directory if it doesn't exist
         os.makedirs(self.results_dir, exist_ok=True)
@@ -74,7 +83,7 @@ class TradingAgent:
     # Improve trading decision logic to reduce losses
     def decide_action(self, current_price, predicted_price, available_capital, current_shares):
         """
-        Decide trading action based on prediction
+        Decide trading action based on prediction and stop-loss criteria
         
         Args:
             current_price: Current stock price
@@ -86,26 +95,56 @@ class TradingAgent:
             action: 'buy', 'sell', or 'hold'
             quantity: Number of shares to buy or sell
         """
-        # Calculate price change percentage
+        # Check stop-loss if we own shares
+        if current_shares > 0:
+            # Update highest price seen since purchase (for trailing stop)
+            if current_price > self.highest_price_since_purchase:
+                self.highest_price_since_purchase = current_price
+            
+            # Calculate price drop from purchase or from highest point if using trailing stop
+            if self.trailing_stop_pct is not None:
+                # Trailing stop: calculate drop from highest price seen
+                price_drop_pct = (self.highest_price_since_purchase - current_price) / self.highest_price_since_purchase * 100
+                stop_threshold = self.trailing_stop_pct
+            else:
+                # Regular stop loss: calculate drop from purchase price
+                price_drop_pct = (self.purchase_price - current_price) / self.purchase_price * 100
+                stop_threshold = self.stop_loss_pct
+                
+            # Trigger stop loss if price drops below threshold
+            if price_drop_pct >= stop_threshold:
+                logging.info(f"Stop-loss triggered: Price dropped {price_drop_pct:.2f}% from {'highest' if self.trailing_stop_pct else 'purchase'} price")
+                return 'sell', current_shares  # Sell all shares
+        
+        # Standard trading logic if stop-loss not triggered
+        # Calculate price change percentage for prediction
         price_change = (predicted_price - current_price) / current_price * 100
         
         # More conservative thresholds
-        buy_threshold = 3.0  # Changed from 2.0
-        sell_threshold = -3.0  # Changed from -2.0
+        buy_threshold = 3.0
+        sell_threshold = -3.0
         
         # Risk-adjusted position sizing
-        max_position = min(0.5, self.risk_factor)  # Cap at 50% of capital
+        max_position = min(0.5, self.risk_factor)
         
         if price_change > buy_threshold and available_capital > current_price:
             # Buy signal
-            # Calculate the position size based on conviction (stronger signal = larger position)
-            conviction = min(price_change / 10, 1.0)  # Scale conviction, max at 10% predicted increase
+            # Calculate the position size based on conviction
+            conviction = min(price_change / 10, 1.0)
             position_size = available_capital * max_position * conviction
             
             # Ensure we don't spend more than available
             max_shares = int(position_size / (current_price * (1 + self.transaction_fee)))
             quantity = max(1, min(max_shares, int(available_capital / (current_price * (1 + self.transaction_fee)))))
             
+            # Update purchase price for stop-loss calculation
+            if current_shares == 0:  # First purchase
+                self.purchase_price = current_price
+                self.highest_price_since_purchase = current_price
+            else:  # Additional purchase - calculate average price
+                total_value = (self.purchase_price * current_shares) + (current_price * quantity)
+                self.purchase_price = total_value / (current_shares + quantity)
+                
             return 'buy', quantity
             
         elif price_change < sell_threshold and current_shares > 0:

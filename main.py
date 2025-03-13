@@ -12,6 +12,7 @@ from src.data.preprocessor import Preprocessor
 from src.models.lstm_model import LSTMModel
 from src.agent.trading_agent import TradingAgent
 from src.evaluation.evaluator import ModelEvaluator
+from src.models.hyperparameter_tuner import HyperparameterTuner
 
 # Configure logging
 logging.basicConfig(
@@ -54,15 +55,42 @@ def parse_arguments():
     parser.add_argument('--load-model', type=str, default=None,
                         help='Path to saved model file')
     
+    parser.add_argument('--tune', action='store_true',
+                        help='Perform hyperparameter tuning')
+    
+    parser.add_argument('--max-trials', type=int, default=10,
+                        help='Maximum number of trials for hyperparameter tuning')
+    
+    parser.add_argument('--use-complete-history', action='store_true',
+                        help='Use complete historical data for training')
+    
+    parser.add_argument('--stop-loss', type=float, default=5.0,
+                        help='Stop loss percentage (e.g., 5.0 = 5%)')
+    
+    parser.add_argument('--trailing-stop', type=float, default=None,
+                        help='Trailing stop percentage (optional)')
+    
     return parser.parse_args()
 
 def train_model(args):
     """Train the LSTM model"""
     logger.info("Starting model training process...")
     
-    # Load data
+    # Load data with option to use complete history
     data_loader = DataLoader("TSLA", api_key=args.newsapi_key)
-    stock_data = data_loader.fetch_stock_data()
+    
+    if args.use_complete_history:
+        logger.info("Fetching complete historical data for TSLA")
+        historical_data = data_loader.fetch_complete_history()
+        
+        # Also get recent data for better predictions
+        recent_data = data_loader.fetch_stock_data()
+        
+        # Combine datasets
+        stock_data = data_loader.combine_datasets(recent_data, historical_data)
+        logger.info(f"Using combined dataset with {len(stock_data)} rows")
+    else:
+        stock_data = data_loader.fetch_stock_data()
     
     if args.newsapi_key:
         data_loader.fetch_news_data()
@@ -74,22 +102,58 @@ def train_model(args):
     )
     X_train, X_test, y_train, y_test = preprocessor.prepare_data(stock_data)
     
-    # Create and train model
-    feature_dim = X_train.shape[2]
-    model = LSTMModel(
-        window_size=args.window_size,
-        prediction_horizon=args.prediction_horizon,
-        feature_dim=feature_dim
-    )
-    
-    history = model.train(X_train, y_train, X_val=X_test, y_val=y_test, epochs=100)
+    # Hyperparameter tuning if requested
+    if args.tune:
+        logger.info(f"Starting hyperparameter tuning with {args.max_trials} trials")
+        
+        tuner = HyperparameterTuner(
+            window_size=args.window_size,
+            prediction_horizon=args.prediction_horizon,
+            feature_dim=X_train.shape[2],
+            max_trials=args.max_trials
+        )
+        
+        best_model, history, best_hps = tuner.tune(
+            X_train, y_train, 
+            X_test, y_test, 
+            epochs=100, 
+            batch_size=32
+        )
+        
+        # If tuning fails, use default model
+        if best_model is None:
+            logger.warning("Hyperparameter tuning failed. Using default model configuration.")
+            model = LSTMModel(
+                window_size=args.window_size,
+                prediction_horizon=args.prediction_horizon,
+                feature_dim=X_train.shape[2]
+            )
+            history = model.train(X_train, y_train, X_val=X_test, y_val=y_test, epochs=100)
+        else:
+            model = best_model
+            logger.info("Successfully created model with tuned hyperparameters")
+    else:
+        # Create and train model with default architecture
+        feature_dim = X_train.shape[2]
+        model = LSTMModel(
+            window_size=args.window_size,
+            prediction_horizon=args.prediction_horizon,
+            feature_dim=feature_dim
+        )
+        
+        history = model.train(X_train, y_train, X_val=X_test, y_val=y_test, epochs=100)
     
     # Evaluate model
     evaluator = ModelEvaluator()
     predictions = model.predict(X_test)
     
     metrics = evaluator.evaluate_price_predictions(y_test, predictions, preprocessor.price_scaler)
+    
+    # Log all metrics including the new classification metrics
     logger.info(f"Training complete. RMSE: {metrics['rmse']:.2f}, Direction Accuracy: {metrics['direction_accuracy']:.2f}")
+    
+    if 'accuracy' in metrics:
+        logger.info(f"Classification metrics - Accuracy: {metrics['accuracy']:.2f}, F1: {metrics['f1']:.2f}")
     
     return model, preprocessor, X_test, y_test
 
@@ -146,12 +210,15 @@ def test_model(args, model=None, preprocessor=None):
         logger.error("No valid model available for testing")
         return None
         
-    # Create trading agent
+    # Create trading agent with stop-loss mechanism
     agent = TradingAgent(
         model=model,
         price_scaler=preprocessor.price_scaler,
         initial_capital=args.initial_capital,
-        transaction_fee=args.transaction_fee
+        transaction_fee=args.transaction_fee,
+        risk_factor=args.risk_factor,
+        stop_loss_pct=args.stop_loss,
+        trailing_stop_pct=args.trailing_stop
     )
     
     try:

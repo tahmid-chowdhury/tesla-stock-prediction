@@ -21,30 +21,89 @@ class DataLoader:
         # Create directories if they don't exist
         os.makedirs(self.raw_dir, exist_ok=True)
         
-    def fetch_stock_data(self, start_date=None, end_date=None):
+    def fetch_stock_data(self, start_date=None, end_date=None, period=None):
         """
         Fetch historical stock data from Yahoo Finance
-        """
-        if start_date is None:
-            start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
-        if end_date is None:
-            end_date = datetime.now().strftime('%Y-%m-%d')
-            
-        logging.info(f"Fetching {self.ticker} data from {start_date} to {end_date}")
         
-        try:
-            data = yf.download(self.ticker, start=start_date, end=end_date)
-            
-            # Save raw data to CSV
-            csv_path = os.path.join(self.raw_dir, f"{self.ticker}.csv")
-            data.to_csv(csv_path)
-            logging.info(f"Stock data saved to {csv_path}")
-            
-            return data
-        except Exception as e:
-            logging.error(f"Error fetching stock data: {e}")
+        Args:
+            start_date: Start date for data (format: YYYY-MM-DD)
+            end_date: End date for data (format: YYYY-MM-DD)
+            period: Alternative to start/end dates (e.g., 'max', '5y', '2y', '1y')
+        
+        Returns:
+            pandas.DataFrame: Historical stock data
+        """
+        # If period is specified, use it instead of start/end dates
+        if period:
+            logging.info(f"Fetching {self.ticker} data for period: {period}")
+            try:
+                data = yf.download(self.ticker, period=period)
+            except Exception as e:
+                logging.error(f"Error fetching data with period {period}: {e}")
+                # Fall back to default 1-year period
+                period = None
+                
+        # If not using period or it failed, use start/end dates
+        if not period:
+            if start_date is None:
+                start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+            if end_date is None:
+                end_date = datetime.now().strftime('%Y-%m-%d')
+                
+            logging.info(f"Fetching {self.ticker} data from {start_date} to {end_date}")
+            try:
+                data = yf.download(self.ticker, start=start_date, end=end_date)
+            except Exception as e:
+                logging.error(f"Error fetching stock data: {e}")
+                return None
+        
+        if data.empty:
+            logging.error("Downloaded data is empty")
             return None
+            
+        # Save raw data to CSV
+        csv_path = os.path.join(self.raw_dir, f"{self.ticker}.csv")
+        data.to_csv(csv_path)
+        logging.info(f"Stock data saved to {csv_path}")
+        
+        return data
+        
+    def fetch_complete_history(self):
+        """
+        Fetch the complete historical data for the stock
+        """
+        return self.fetch_stock_data(period='max')
     
+    def combine_datasets(self, recent_data, historical_data):
+        """
+        Combine recent and historical datasets intelligently
+        
+        Args:
+            recent_data: DataFrame with recent stock data
+            historical_data: DataFrame with historical stock data
+            
+        Returns:
+            pandas.DataFrame: Combined dataset
+        """
+        if recent_data is None or historical_data is None:
+            return recent_data if recent_data is not None else historical_data
+            
+        # Both datasets should have DatetimeIndex
+        if not isinstance(recent_data.index, pd.DatetimeIndex) or not isinstance(historical_data.index, pd.DatetimeIndex):
+            logging.error("Both datasets must have DatetimeIndex for combining")
+            return recent_data  # Return recent data as fallback
+            
+        # Combine and remove duplicates, keeping the most recent data
+        combined = pd.concat([historical_data, recent_data])
+        combined = combined[~combined.index.duplicated(keep='last')]
+        
+        # Sort by date
+        combined = combined.sort_index()
+        
+        logging.info(f"Combined dataset has {len(combined)} rows spanning from {combined.index.min().date()} to {combined.index.max().date()}")
+        
+        return combined
+
     # Improve news data fetching to handle API limitations
     def fetch_news_data(self, days_back=30):
         """

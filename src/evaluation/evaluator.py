@@ -26,7 +26,7 @@ class ModelEvaluator:
     
     def evaluate_price_predictions(self, y_true, y_pred, price_scaler=None):
         """
-        Evaluate price prediction accuracy
+        Evaluate price prediction accuracy with enhanced metrics
         """
         # If scaler is provided, inverse transform to original price scale
         if price_scaler is not None:
@@ -53,22 +53,121 @@ class ModelEvaluator:
         
         direction_correct = np.mean(y_true_dir == y_pred_dir)
         
-        # Save results to CSV
+        # Calculate additional metrics
+        
+        # MAPE (Mean Absolute Percentage Error)
+        mape = np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+        
+        # Calculate price direction prediction accuracy (up or down)
+        # For multi-step predictions, we calculate for each step
+        direction_accuracies = []
+        for i in range(1, y_true.shape[1]):
+            y_true_dir = (y_true[:, i] > y_true[:, i-1])
+            y_pred_dir = (y_pred[:, i] > y_pred[:, i-1])
+            direction_accuracies.append(np.mean(y_true_dir == y_pred_dir))
+        
+        overall_direction_accuracy = np.mean(direction_accuracies)
+        
+        # Generate directional trading signals (1: Buy, 0: Hold, -1: Sell)
+        y_true_signals = np.zeros_like(y_true[:, :-1])
+        y_pred_signals = np.zeros_like(y_pred[:, :-1])
+        
+        # Signal is Buy if price increases more than 1%, Sell if decreases more than 1%, else Hold
+        threshold = 0.01  # 1%
+        
+        for i in range(y_true.shape[1]-1):
+            y_true_pct_change = (y_true[:, i+1] - y_true[:, i]) / y_true[:, i]
+            y_pred_pct_change = (y_pred[:, i+1] - y_pred[:, i]) / y_pred[:, i]
+            
+            # True signals
+            y_true_signals[:, i] = np.where(y_true_pct_change > threshold, 1, 
+                                            np.where(y_true_pct_change < -threshold, -1, 0))
+            
+            # Predicted signals
+            y_pred_signals[:, i] = np.where(y_pred_pct_change > threshold, 1, 
+                                           np.where(y_pred_pct_change < -threshold, -1, 0))
+        
+        # Flatten for classification metrics
+        y_true_signals_flat = y_true_signals.flatten()
+        y_pred_signals_flat = y_pred_signals.flatten()
+        
+        # Only calculate classification metrics if we have more than one class
+        unique_classes = np.unique(np.concatenate([y_true_signals_flat, y_pred_signals_flat]))
+        
+        classification_metrics = {}
+        if len(unique_classes) > 1:
+            # Convert to classes compatible with sklearn
+            y_true_classes = y_true_signals_flat + 1  # Convert from [-1,0,1] to [0,1,2]
+            y_pred_classes = y_pred_signals_flat + 1
+            
+            # Calculate classification metrics
+            try:
+                classification_metrics = {
+                    'accuracy': accuracy_score(y_true_classes, y_pred_classes),
+                    'precision': precision_score(y_true_classes, y_pred_classes, average='weighted', zero_division=0),
+                    'recall': recall_score(y_true_classes, y_pred_classes, average='weighted', zero_division=0),
+                    'f1': f1_score(y_true_classes, y_pred_classes, average='weighted', zero_division=0)
+                }
+                
+                # Create confusion matrix for signal prediction
+                cm = confusion_matrix(y_true_classes, y_pred_classes)
+                
+                # Plot confusion matrix
+                plt.figure(figsize=(10, 8))
+                if SEABORN_AVAILABLE:
+                    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                              xticklabels=['Sell', 'Hold', 'Buy'],
+                              yticklabels=['Sell', 'Hold', 'Buy'])
+                else:
+                    plt.imshow(cm, interpolation='nearest', cmap='Blues')
+                    plt.colorbar()
+                    
+                    # Add labels and values to the plot
+                    tick_marks = np.arange(3)
+                    plt.xticks(tick_marks, ['Sell', 'Hold', 'Buy'])
+                    plt.yticks(tick_marks, ['Sell', 'Hold', 'Buy'])
+                    
+                    # Add text annotations for values
+                    for i in range(cm.shape[0]):
+                        for j in range(cm.shape[1]):
+                            plt.text(j, i, format(cm[i, j], 'd'),
+                                    ha="center", va="center",
+                                    color="white" if cm[i, j] > cm.max() / 2 else "black")
+                
+                plt.title('Trading Signal Confusion Matrix')
+                plt.xlabel('Predicted Signal')
+                plt.ylabel('True Signal')
+                plt.tight_layout()
+                plt.savefig(os.path.join(self.results_dir, 'signal_confusion_matrix.png'))
+                plt.close()
+            except Exception as e:
+                logging.warning(f"Could not calculate classification metrics: {e}")
+        
+        # Save results to CSV with added metrics
         results = {
             'Metric': ['MSE', 'RMSE', 'MAE', 'MAPE', 'Direction Accuracy'],
-            'Value': [mse, rmse, mae, mape, direction_correct]
+            'Value': [mse, rmse, mae, mape, overall_direction_accuracy]
         }
+        
+        # Add classification metrics if available
+        for metric, value in classification_metrics.items():
+            results['Metric'].append(f'Signal {metric.capitalize()}')
+            results['Value'].append(value)
         
         results_df = pd.DataFrame(results)
         results_df.to_csv(os.path.join(self.results_dir, 'price_prediction_metrics.csv'), index=False)
         
-        return {
+        # Return all metrics
+        metrics_dict = {
             'mse': mse,
             'rmse': rmse,
             'mae': mae,
             'mape': mape,
-            'direction_accuracy': direction_correct
+            'direction_accuracy': overall_direction_accuracy
         }
+        metrics_dict.update(classification_metrics)
+        
+        return metrics_dict
     
     def evaluate_trading_decisions(self, transactions_df):
         """
