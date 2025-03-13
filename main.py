@@ -64,11 +64,20 @@ def parse_arguments():
     parser.add_argument('--use-complete-history', action='store_true',
                         help='Use complete historical data for training')
     
-    parser.add_argument('--stop-loss', type=float, default=5.0,
-                        help='Stop loss percentage (e.g., 5.0 = 5%)')
+    parser.add_argument('--stop-loss', type=float, default=7.0,
+                        help='Stop loss percentage (e.g., 7.0 = 7%)')
     
-    parser.add_argument('--trailing-stop', type=float, default=None,
-                        help='Trailing stop percentage (optional)')
+    parser.add_argument('--trailing-stop', type=float, default=5.0,
+                        help='Trailing stop percentage')
+    
+    parser.add_argument('--max-trades-per-day', type=int, default=2,
+                        help='Maximum number of trades per day')
+    
+    parser.add_argument('--max-drawdown', type=float, default=20.0,
+                        help='Maximum drawdown percentage before halting trading')
+                        
+    parser.add_argument('--volatility-scaling', action='store_true',
+                        help='Enable volatility-based stop-loss scaling')
     
     return parser.parse_args()
 
@@ -210,7 +219,7 @@ def test_model(args, model=None, preprocessor=None):
         logger.error("No valid model available for testing")
         return None
         
-    # Create trading agent with stop-loss mechanism
+    # Create trading agent with stop-loss mechanism and new parameters
     agent = TradingAgent(
         model=model,
         price_scaler=preprocessor.price_scaler,
@@ -218,7 +227,10 @@ def test_model(args, model=None, preprocessor=None):
         transaction_fee=args.transaction_fee,
         risk_factor=args.risk_factor,
         stop_loss_pct=args.stop_loss,
-        trailing_stop_pct=args.trailing_stop
+        trailing_stop_pct=args.trailing_stop,
+        max_trades_per_day=args.max_trades_per_day,
+        max_drawdown_pct=args.max_drawdown,
+        volatility_scaling=args.volatility_scaling
     )
     
     try:
