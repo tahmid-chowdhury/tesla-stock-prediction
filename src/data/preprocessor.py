@@ -39,12 +39,29 @@ class Preprocessor:
         # Make a copy to avoid SettingWithCopyWarning
         df = df.copy()
         
+        # Log available columns for debugging
+        logging.info(f"Columns before adding indicators: {df.columns.tolist()}")
+        
+        # Find price and volume columns with flexible naming patterns
+        close_col = self._find_column_by_pattern(df, ['close', 'adj close', 'adjusted close'])
+        high_col = self._find_column_by_pattern(df, ['high'])
+        low_col = self._find_column_by_pattern(df, ['low'])
+        open_col = self._find_column_by_pattern(df, ['open'])
+        volume_col = self._find_column_by_pattern(df, ['volume'])
+        
+        if not close_col or not high_col or not low_col or not open_col or not volume_col:
+            logging.error(f"Could not find all required price columns. Available: {df.columns.tolist()}")
+            raise ValueError("Missing required price columns for technical indicators")
+        
+        # Log which columns we're using
+        logging.info(f"Using columns: Close={close_col}, High={high_col}, Low={low_col}, Open={open_col}, Volume={volume_col}")
+        
         # Ensure price and volume data are 1-dimensional
-        close_series = df['Close'].squeeze() if hasattr(df['Close'], 'squeeze') else df['Close']
-        high_series = df['High'].squeeze() if hasattr(df['High'], 'squeeze') else df['High']
-        low_series = df['Low'].squeeze() if hasattr(df['Low'], 'squeeze') else df['Low']
-        open_series = df['Open'].squeeze() if hasattr(df['Open'], 'squeeze') else df['Open']
-        volume_series = df['Volume'].squeeze() if hasattr(df['Volume'], 'squeeze') else df['Volume']
+        close_series = df[close_col].squeeze() if hasattr(df[close_col], 'squeeze') else df[close_col]
+        high_series = df[high_col].squeeze() if hasattr(df[high_col], 'squeeze') else df[high_col]
+        low_series = df[low_col].squeeze() if hasattr(df[low_col], 'squeeze') else df[low_col]
+        open_series = df[open_col].squeeze() if hasattr(df[open_col], 'squeeze') else df[open_col]
+        volume_series = df[volume_col].squeeze() if hasattr(df[volume_col], 'squeeze') else df[volume_col]
         
         # Basic indicators
         df['MA_5'] = ta.trend.sma_indicator(close_series, window=5)
@@ -128,11 +145,44 @@ class Preprocessor:
                        (close_series > open_series) & 
                        ((close_series - low_series) / (.001 + high_series - low_series) > 0.6)).astype(float)
         
+        # Rename the close column to 'Close' if it's not already called that
+        if close_col != 'Close':
+            df['Close'] = df[close_col]
+            logging.info(f"Created 'Close' column from '{close_col}' for consistency")
+        
         # Drop NaN values resulting from indicators
         df = df.dropna()
         
         return df
-    
+
+    def _find_column_by_pattern(self, df, patterns):
+        """
+        Find column by pattern, case insensitive
+        
+        Args:
+            df: DataFrame to search in
+            patterns: List of possible name patterns to look for
+        
+        Returns:
+            Column name if found, None otherwise
+        """
+        for col in df.columns:
+            col_lower = str(col).lower()
+            
+            # Check for exact matches first
+            for pattern in patterns:
+                if col_lower == pattern:
+                    return col
+                    
+            # Then check for pattern matches (contains)
+            for pattern in patterns:
+                if pattern in col_lower:
+                    return col
+        
+        # If no match found, log and return None
+        logging.warning(f"Could not find column matching patterns {patterns} in {df.columns.tolist()}")
+        return None
+
     def create_sliding_windows(self, df):
         """
         Create sliding windows of data for sequence prediction
@@ -178,7 +228,7 @@ class Preprocessor:
     def process_news_sentiment(self, stock_data):
         """
         Process news sentiment and merge with stock data
-        This is a simplified version - a real implementation would use NLP
+        Performs sentiment analysis on news headlines and content
         """
         news_path = os.path.join(self.raw_dir, "TSLA_news.json")
         
@@ -187,8 +237,25 @@ class Preprocessor:
             return stock_data
             
         try:
+            # Install required packages if not available
+            try:
+                from textblob import TextBlob
+            except ImportError:
+                import sys
+                import subprocess
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "textblob"])
+                from textblob import TextBlob
+            
             with open(news_path, 'r') as f:
                 news_data = json.load(f)
+            
+            # Log the structure of the loaded news data
+            logging.info(f"News data loaded. Structure: {list(news_data.keys()) if isinstance(news_data, dict) else 'Not a dictionary'}")
+            
+            # Ensure we have articles in the expected format
+            if 'articles' not in news_data or not news_data['articles']:
+                logging.warning("No articles found in news data or unexpected format")
+                return stock_data
                 
             # Convert news data to dataframe
             news_df = pd.DataFrame(news_data['articles'])
@@ -197,36 +264,203 @@ class Preprocessor:
             news_df['publishedAt'] = pd.to_datetime(news_df['publishedAt'])
             news_df['date'] = news_df['publishedAt'].dt.date
             
-            # Group by date and count articles (very basic sentiment indicator)
-            daily_news_count = news_df.groupby('date').size().reset_index(name='news_count')
-            daily_news_count['date'] = pd.to_datetime(daily_news_count['date'])
+            # Calculate sentiment for each article using TextBlob
+            def get_sentiment_scores(title, description):
+                # Combine title and description, handling None values
+                text = ' '.join(filter(None, [str(title) if title else "", str(description) if description else ""]))
+                if not text:
+                    return 0, 0  # Neutral if no text
+                
+                # Get sentiment polarity (-1 to 1) and subjectivity (0 to 1)
+                sentiment = TextBlob(text)
+                return sentiment.polarity, sentiment.subjectivity
             
-            # Merge with stock data
-            stock_data = stock_data.reset_index()
-            stock_data['Date'] = pd.to_datetime(stock_data['Date'])
-            merged_data = pd.merge(stock_data, daily_news_count, 
-                                  left_on='Date', right_on='date', 
-                                  how='left')
-                                  
-            merged_data = merged_data.drop('date', axis=1)
-            merged_data['news_count'] = merged_data['news_count'].fillna(0)
-            merged_data = merged_data.set_index('Date')
+            # Apply sentiment analysis to each article
+            sentiments = news_df.apply(
+                lambda x: get_sentiment_scores(x.get('title', ''), x.get('description', '')), 
+                axis=1
+            )
+            news_df['polarity'] = [s[0] for s in sentiments]
+            news_df['subjectivity'] = [s[1] for s in sentiments]
+            
+            # Group by date and calculate various sentiment metrics
+            sentiment_metrics = news_df.groupby('date').agg({
+                'title': 'count',                      # Number of articles
+                'polarity': ['mean', 'std', 'min', 'max'],  # Sentiment polarity stats
+                'subjectivity': ['mean', 'max']        # Subjectivity stats
+            })
+            
+            # Flatten the MultiIndex columns
+            flat_columns = []
+            for col in sentiment_metrics.columns:
+                if isinstance(col, tuple) and len(col) > 1:
+                    flat_columns.append(f'news_{col[0]}_{col[1]}')
+                else:
+                    flat_name = col[0] if isinstance(col, tuple) else col
+                    flat_columns.append(f'news_{flat_name}')
+                    
+            sentiment_metrics.columns = flat_columns
+            
+            # Rename count column if it exists
+            if 'news_title_count' in sentiment_metrics.columns:
+                sentiment_metrics.rename(columns={'news_title_count': 'news_count'}, inplace=True)
+            
+            # Add weighted sentiment (more weight to articles with high subjectivity)
+            try:
+                weighted_sentiment = news_df.groupby('date').apply(
+                    lambda x: np.average(x['polarity'], weights=x['subjectivity']+0.1)
+                    if len(x) > 0 else 0
+                )
+                sentiment_metrics['news_weighted_sentiment'] = weighted_sentiment
+            except Exception as e:
+                logging.error(f"Error calculating weighted sentiment: {e}")
+                # Add a default weighted sentiment in case of error
+                sentiment_metrics['news_weighted_sentiment'] = sentiment_metrics['news_polarity_mean'] if 'news_polarity_mean' in sentiment_metrics.columns else 0
+            
+            # Reset index for sentiment metrics
+            sentiment_metrics = sentiment_metrics.reset_index()
+            sentiment_metrics['date'] = pd.to_datetime(sentiment_metrics['date'])
+            
+            # Check for MultiIndex in rows or columns of stock_data
+            has_multiindex_rows = isinstance(stock_data.index, pd.MultiIndex)
+            has_multiindex_cols = isinstance(stock_data.columns, pd.MultiIndex)
+            
+            logging.info(f"Stock data index type: {type(stock_data.index).__name__}, MultiIndex: {has_multiindex_rows}")
+            logging.info(f"Stock data columns type: {type(stock_data.columns).__name__}, MultiIndex: {has_multiindex_cols}")
+            
+            # Store original index and columns to restore later
+            original_index = stock_data.index
+            original_columns = stock_data.columns
+            
+            # Create a working copy with simplified structure for merging
+            working_df = stock_data.copy()
+            
+            # Handle MultiIndex rows if present
+            if has_multiindex_rows:
+                logging.info(f"Stock data has MultiIndex rows with levels: {stock_data.index.names}")
+                # Save the index names
+                index_names = stock_data.index.names
+                # Reset index to convert to regular columns
+                working_df = working_df.reset_index()
+            else:
+                working_df = working_df.reset_index()
+                # Ensure the index column is named properly
+                if 'index' in working_df.columns:
+                    working_df.rename(columns={'index': 'Date'}, inplace=True)
+            
+            # Handle MultiIndex columns if present
+            if has_multiindex_cols:
+                logging.info(f"Stock data has MultiIndex columns: {[col for col in stock_data.columns[:5]]}")
+                # Flatten MultiIndex columns for easier merging
+                flat_stock_columns = []
+                for col in working_df.columns:
+                    if isinstance(col, tuple):
+                        flat_stock_columns.append('_'.join(str(c) for c in col if c))
+                    else:
+                        flat_stock_columns.append(str(col))
+                working_df.columns = flat_stock_columns
+            
+            # Ensure Date column exists for merging
+            date_col = None
+            for col in working_df.columns:
+                if isinstance(col, str) and col.lower() == 'date':
+                    date_col = col
+                    break
+            
+            if date_col is None:
+                logging.error(f"Cannot find date column for merging. Available columns: {working_df.columns.tolist()}")
+                return stock_data
+            
+            # Make sure the date column is datetime type
+            working_df[date_col] = pd.to_datetime(working_df[date_col])
+            
+            # Log column information before merge
+            logging.info(f"Working DataFrame columns before merge: {working_df.columns.tolist()}")
+            logging.info(f"Sentiment metrics columns before merge: {sentiment_metrics.columns.tolist()}")
+            
+            # Perform the merge on flattened DataFrames
+            merged_data = pd.merge(
+                working_df,
+                sentiment_metrics,
+                left_on=date_col,
+                right_on='date',
+                how='left'
+            )
+            
+            # Fill missing sentiment values
+            for col in merged_data.columns:
+                if isinstance(col, str) and col.startswith('news_'):
+                    if 'polarity' in col or 'sentiment' in col:
+                        merged_data[col] = merged_data[col].fillna(0)  # Neutral sentiment
+                    else:
+                        merged_data[col] = merged_data[col].fillna(0)  # No news = 0
+            
+            # Drop the redundant date column
+            if 'date' in merged_data.columns:
+                merged_data = merged_data.drop('date', axis=1)
+            
+            # Try to restore original index structure if possible
+            if has_multiindex_rows:
+                try:
+                    # Get the index level columns from the merged DataFrame
+                    index_columns = [col for col in merged_data.columns if col in index_names or col in [str(name) for name in index_names]]
+                    if index_columns:
+                        merged_data = merged_data.set_index(index_columns)
+                        logging.info(f"Restored MultiIndex with levels: {merged_data.index.names}")
+                    else:
+                        # Use date as index if original index columns not found
+                        if date_col in merged_data.columns:
+                            merged_data = merged_data.set_index(date_col)
+                            logging.info(f"Used {date_col} as index because original index columns not found")
+                except Exception as e:
+                    logging.error(f"Error restoring original index: {e}")
+                    # Fall back to using Date as index
+                    if date_col in merged_data.columns:
+                        merged_data = merged_data.set_index(date_col)
+            else:
+                # Restore simple index (Date column)
+                if date_col in merged_data.columns:
+                    merged_data = merged_data.set_index(date_col)
+            
+            # Count news features for logging
+            news_feature_count = sum(1 for col in merged_data.columns if isinstance(col, str) and col.startswith('news_'))
+            logging.info(f"Added {news_feature_count} news sentiment features")
             
             return merged_data
+            
         except Exception as e:
             logging.error(f"Error processing news data: {e}")
+            import traceback
+            logging.error(traceback.format_exc())
             return stock_data
     
-    # Improve handling of MultiIndex columns
     def prepare_data(self, stock_data):
         """
         Main function to prepare data for model training
         """
         # Add news sentiment if available (optional)
         try:
+            # Process news sentiment - this adds multiple sentiment features
             stock_data = self.process_news_sentiment(stock_data)
+            logging.info(f"News sentiment features added to dataset")
+            
+            # Check which sentiment features were added (for debugging)
+            sentiment_cols = []
+            for col in stock_data.columns:
+                if isinstance(col, str) and col.startswith('news_'):
+                    sentiment_cols.append(col)
+                elif isinstance(col, tuple) and len(col) > 0 and isinstance(col[0], str) and col[0].startswith('news_'):
+                    sentiment_cols.append(col)
+            
+            if sentiment_cols:
+                logging.info(f"Added sentiment features: {sentiment_cols}")
+            else:
+                logging.warning("No sentiment features were added")
+                
         except Exception as e:
             logging.error(f"Error in news sentiment processing: {e}")
+            import traceback
+            logging.error(traceback.format_exc())
         
         # Handle MultiIndex columns if present
         if isinstance(stock_data.columns, pd.MultiIndex):
@@ -249,19 +483,25 @@ class Preprocessor:
         else:
             df = stock_data.copy()
         
-        # Add technical indicators
+        # Add technical indicators with flexible column name handling
         df = self.add_technical_indicators(df)
         logging.info(f"Added technical indicators. Shape: {df.shape}")
         
-        # Ensure consistent column naming for 'Close'
-        if 'Close' not in df.columns:
-            close_cols = [col for col in df.columns if isinstance(col, str) and col.lower() == 'close']
-            if close_cols:
-                # Rename the column to 'Close'
-                df = df.rename(columns={close_cols[0]: 'Close'})
-                logging.info(f"Renamed column '{close_cols[0]}' to 'Close'")
-            else:
-                logging.error(f"No 'Close' column found. Available columns: {df.columns.tolist()}")
+        # Ensure we have a 'Close' column for prediction
+        close_col = None
+        for col in df.columns:
+            col_str = str(col).lower()
+            if col_str == 'close' or 'close' in col_str:
+                close_col = col
+                break
+        
+        if close_col is None:
+            logging.error(f"No 'Close' column found after processing. Available columns: {df.columns.tolist()}")
+            raise ValueError("Missing 'Close' column required for prediction target")
+        
+        if close_col != 'Close':
+            df['Close'] = df[close_col]
+            logging.info(f"Using '{close_col}' as the Close price column")
         
         # Scale the closing prices for prediction
         close_prices = df['Close'].values.reshape(-1, 1)

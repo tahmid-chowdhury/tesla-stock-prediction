@@ -14,12 +14,13 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 class LSTMModel:
     def __init__(self, window_size=30, prediction_horizon=5, feature_dim=None):
         """
-        Initialize LSTM model
+        Initialize LSTM model for stock price prediction
         
         Args:
-            window_size: Size of input sequence
-            prediction_horizon: Number of days to predict
-            feature_dim: Number of features
+            window_size: Size of sliding window (days) for feature creation
+            prediction_horizon: Number of days to predict ahead
+            feature_dim: Number of features in input data (computed automatically if None)
+                         This should include technical indicators and news sentiment features
         """
         self.window_size = window_size
         self.prediction_horizon = prediction_horizon

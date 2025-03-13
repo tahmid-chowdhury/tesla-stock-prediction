@@ -10,9 +10,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 class DataLoader:
     def __init__(self, ticker="TSLA", api_key=None):
-        """
-        Initialize DataLoader with stock ticker and optional NewsAPI key
-        """
         self.ticker = ticker
         self.api_key = api_key
         self.data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data")
@@ -20,7 +17,7 @@ class DataLoader:
         
         # Create directories if they don't exist
         os.makedirs(self.raw_dir, exist_ok=True)
-        
+    
     def fetch_stock_data(self, start_date=None, end_date=None, period=None):
         """
         Fetch historical stock data from Yahoo Finance
@@ -73,53 +70,36 @@ class DataLoader:
         Fetch the complete historical data for the stock
         """
         return self.fetch_stock_data(period='max')
-    
+        
     def combine_datasets(self, recent_data, historical_data):
         """
-        Combine recent and historical datasets intelligently
-        
-        Args:
-            recent_data: DataFrame with recent stock data
-            historical_data: DataFrame with historical stock data
-            
-        Returns:
-            pandas.DataFrame: Combined dataset
+        Combine two datasets, keeping all rows from both without duplicates
         """
         if recent_data is None or historical_data is None:
             return recent_data if recent_data is not None else historical_data
             
-        # Both datasets should have DatetimeIndex
-        if not isinstance(recent_data.index, pd.DatetimeIndex) or not isinstance(historical_data.index, pd.DatetimeIndex):
-            logging.error("Both datasets must have DatetimeIndex for combining")
-            return recent_data  # Return recent data as fallback
-            
-        # Combine and remove duplicates, keeping the most recent data
+        # Combine and remove duplicates, keeping newer data when duplicated
         combined = pd.concat([historical_data, recent_data])
         combined = combined[~combined.index.duplicated(keep='last')]
-        
-        # Sort by date
         combined = combined.sort_index()
         
-        logging.info(f"Combined dataset has {len(combined)} rows spanning from {combined.index.min().date()} to {combined.index.max().date()}")
-        
         return combined
-
-    # Improve news data fetching to handle API limitations
-    def fetch_news_data(self, days_back=30):
+        
+    def fetch_news_data(self, days_back=20):
         """
         Fetch news data for a ticker using NewsAPI
         
         Args:
-            days_back: Number of days to look back (default: 30 for free tier limitation)
+            days_back: Number of days to look back (default: 20 for free tier limitation)
         """
         if not self.api_key:
             logging.warning("No NewsAPI key provided. Skipping news data retrieval.")
             return None
             
-        # Calculate date range (limit to 30 days for free API tier)
+        # Calculate date range (limit to 20 days for free API tier)
         end_date = datetime.now()
-        # Free tier of NewsAPI typically only allows 30 days back
-        start_date = end_date - timedelta(days=min(days_back, 30))
+        # Free tier of NewsAPI typically only allows 20 days back
+        start_date = end_date - timedelta(days=min(days_back, 20))
         
         logging.info(f"Fetching news for {self.ticker} from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
         

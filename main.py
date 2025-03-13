@@ -104,12 +104,39 @@ def train_model(args):
     if args.newsapi_key:
         data_loader.fetch_news_data()
     
+    # Debug the column structure before processing
+    if isinstance(stock_data.columns, pd.MultiIndex):
+        logger.info(f"Stock data has MultiIndex columns: {[col for col in stock_data.columns[:5]]}")
+        
+        # If MultiIndex columns, normalize them first before preprocessing
+        renamed_data = {}
+        for name in ['Close', 'Open', 'High', 'Low', 'Volume']:
+            col_matches = [col for col in stock_data.columns if name in col[0]]
+            if col_matches:
+                renamed_data[name] = stock_data[col_matches[0]]
+        
+        if renamed_data:
+            logger.info("Standardizing MultiIndex columns to simple column names")
+            stock_data = pd.DataFrame(renamed_data, index=stock_data.index)
+    
     # Preprocess data
     preprocessor = Preprocessor(
         window_size=args.window_size,
         prediction_horizon=args.prediction_horizon
     )
-    X_train, X_test, y_train, y_test = preprocessor.prepare_data(stock_data)
+    
+    try:
+        X_train, X_test, y_train, y_test = preprocessor.prepare_data(stock_data)
+    except Exception as e:
+        logger.error(f"Error in data preprocessing: {e}")
+        if isinstance(stock_data.columns, pd.MultiIndex):
+            logger.error("Trying alternative MultiIndex handling...")
+            # Flatten the MultiIndex columns
+            stock_data.columns = [f"{col[0]}_{col[1]}" if isinstance(col, tuple) else col for col in stock_data.columns]
+            # Try again with flattened columns
+            X_train, X_test, y_train, y_test = preprocessor.prepare_data(stock_data)
+        else:
+            raise
     
     # Hyperparameter tuning if requested
     if args.tune:
