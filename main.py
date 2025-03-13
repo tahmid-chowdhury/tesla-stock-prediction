@@ -1,145 +1,355 @@
 import os
-import pandas as pd
 import numpy as np
+import pandas as pd
+import argparse
+import logging
 from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
-from src.data.preprocess import preprocess_data
 
-# Import sklearn_model instead of lstm_model
-from src.models.sklearn_model import StockPredictionModel, train_model
+# Import custom modules
+from src.data.data_loader import DataLoader
+from src.data.preprocessor import Preprocessor
+from src.models.lstm_model import LSTMModel
 from src.agent.trading_agent import TradingAgent
-from src.evaluation.backtesting import TradingSimulation
+from src.evaluation.evaluator import ModelEvaluator
 
-# Import new forecast utilities
-from src.utils.date_utils import generate_future_trading_days, get_last_trading_day
-from src.forecasting.price_forecaster import StockForecaster
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("app.log"),
+        logging.StreamHandler()
+    ]
+)
 
-# Add imports for new features
-from src.evaluation.strategy_comparison import compare_strategies
-from src.visualization.dashboard import create_dashboard
-from src.debug.test_direction_prediction import test_direction_prediction_accuracy
+logger = logging.getLogger(__name__)
+
+def parse_arguments():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description='Tesla Stock Trading Agent')
+    
+    parser.add_argument('--mode', type=str, default='train', 
+                        choices=['train', 'test', 'trade'],
+                        help='Mode of operation: train, test, or trade')
+    
+    parser.add_argument('--window-size', type=int, default=30,
+                        help='Size of sliding window (days) for feature creation')
+    
+    parser.add_argument('--prediction-horizon', type=int, default=5,
+                        help='Number of days to predict ahead')
+    
+    parser.add_argument('--initial-capital', type=float, default=10000,
+                        help='Initial investment amount')
+    
+    parser.add_argument('--transaction-fee', type=float, default=0.01,
+                        help='Transaction fee as a percentage (0.01 = 1%)')
+    
+    parser.add_argument('--risk-factor', type=float, default=0.3,
+                        help='Risk factor for trade sizing (0.1-0.5)')
+    
+    parser.add_argument('--newsapi-key', type=str, default=None,
+                        help='API key for NewsAPI (optional)')
+    
+    parser.add_argument('--load-model', type=str, default=None,
+                        help='Path to saved model file')
+    
+    return parser.parse_args()
+
+def train_model(args):
+    """Train the LSTM model"""
+    logger.info("Starting model training process...")
+    
+    # Load data
+    data_loader = DataLoader("TSLA", api_key=args.newsapi_key)
+    stock_data = data_loader.fetch_stock_data()
+    
+    if args.newsapi_key:
+        data_loader.fetch_news_data()
+    
+    # Preprocess data
+    preprocessor = Preprocessor(
+        window_size=args.window_size,
+        prediction_horizon=args.prediction_horizon
+    )
+    X_train, X_test, y_train, y_test = preprocessor.prepare_data(stock_data)
+    
+    # Create and train model
+    feature_dim = X_train.shape[2]
+    model = LSTMModel(
+        window_size=args.window_size,
+        prediction_horizon=args.prediction_horizon,
+        feature_dim=feature_dim
+    )
+    
+    history = model.train(X_train, y_train, X_val=X_test, y_val=y_test, epochs=100)
+    
+    # Evaluate model
+    evaluator = ModelEvaluator()
+    predictions = model.predict(X_test)
+    
+    metrics = evaluator.evaluate_price_predictions(y_test, predictions, preprocessor.price_scaler)
+    logger.info(f"Training complete. RMSE: {metrics['rmse']:.2f}, Direction Accuracy: {metrics['direction_accuracy']:.2f}")
+    
+    return model, preprocessor, X_test, y_test
+
+def test_model(args, model=None, preprocessor=None):
+    """Test the model on historical data"""
+    logger.info("Starting model testing process...")
+    
+    model_loaded = False
+    
+    if model is None or preprocessor is None:
+        # Load data if not provided
+        data_loader = DataLoader("TSLA")
+        stock_data = data_loader.fetch_stock_data()
+        
+        preprocessor = Preprocessor(
+            window_size=args.window_size,
+            prediction_horizon=args.prediction_horizon
+        )
+        
+        try:
+            X_train, X_test, y_train, y_test = preprocessor.prepare_data(stock_data)
+            
+            # Load saved model
+            model = LSTMModel(
+                window_size=args.window_size,
+                prediction_horizon=args.prediction_horizon,
+                feature_dim=X_test.shape[2]
+            )
+            
+            if args.load_model:
+                model_loaded = model.load_saved_model(args.load_model)
+            else:
+                model_loaded = model.load_saved_model()
+                
+            if not model_loaded:
+                logger.error("Failed to load model. Cannot proceed with testing.")
+                return None
+        except Exception as e:
+            logger.error(f"Error preparing data or loading model: {e}")
+            return None
+    else:
+        # Get test data from preprocessor
+        try:
+            processed_dir = os.path.join(os.path.dirname(__file__), "data", "processed")
+            X_test = np.load(os.path.join(processed_dir, "X_test.npy"))
+            y_test = np.load(os.path.join(processed_dir, "y_test.npy"))
+            model_loaded = True
+        except Exception as e:
+            logger.error(f"Error loading test data: {e}")
+            return None
+    
+    # Only proceed if we have a valid model
+    if not model_loaded:
+        logger.error("No valid model available for testing")
+        return None
+        
+    # Create trading agent
+    agent = TradingAgent(
+        model=model,
+        price_scaler=preprocessor.price_scaler,
+        initial_capital=args.initial_capital,
+        transaction_fee=args.transaction_fee
+    )
+    
+    try:
+        # Load dates for test data
+        data_loader = DataLoader("TSLA")
+        stock_data = data_loader.fetch_stock_data()
+        test_dates = stock_data.index[-len(X_test):]
+        
+        # Run simulation
+        final_value, roi = agent.run_simulation(
+            test_data=X_test,
+            test_dates=test_dates,
+            feature_scaler=preprocessor.feature_scaler,
+            final_trade=True
+        )
+        
+        # Evaluate trading performance
+        evaluator = ModelEvaluator()
+        transactions_df = pd.DataFrame(agent.transaction_history)
+        if not transactions_df.empty:
+            metrics = evaluator.evaluate_trading_decisions(transactions_df)
+            logger.info(f"Testing complete. Final portfolio value: ${final_value:.2f}, ROI: {roi:.2f}%")
+        else:
+            logger.warning("No transactions were executed during testing")
+            
+        return agent
+    except Exception as e:
+        logger.error(f"Error during testing simulation: {e}")
+        return None
+
+def trade(args):
+    """Run the agent in trading mode on recent data"""
+    logger.info("Starting trading mode...")
+    
+    # Load fresh data
+    data_loader = DataLoader("TSLA", api_key=args.newsapi_key)
+    stock_data = data_loader.fetch_stock_data(
+        start_date=(datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d'),
+        end_date=datetime.now().strftime('%Y-%m-%d')
+    )
+    
+    # Process data
+    preprocessor = Preprocessor(
+        window_size=args.window_size,
+        prediction_horizon=args.prediction_horizon
+    )
+    preprocessor.prepare_data(stock_data)
+    
+    # Load model
+    model = LSTMModel(
+        window_size=args.window_size,
+        prediction_horizon=args.prediction_horizon
+    )
+    
+    if args.load_model:
+        model.load_saved_model(args.load_model)
+    else:
+        model.load_saved_model()
+    
+    # Get most recent window of data for prediction
+    processed_dir = os.path.join(os.path.dirname(__file__), "data", "processed")
+    X_train = np.load(os.path.join(processed_dir, "X_train.npy"))
+    recent_window = X_train[-1:]  # Get the most recent window
+    
+    # Make prediction for next 5 days
+    predictions = model.predict(recent_window)
+    if preprocessor.price_scaler is not None:
+        predictions = preprocessor.price_scaler.inverse_transform(predictions)
+    
+    # Get current price, handling MultiIndex columns if present
+    try:
+        if isinstance(stock_data.columns, pd.MultiIndex):
+            # Find the Close column in the MultiIndex
+            close_cols = [col for col in stock_data.columns if 'Close' in col]
+            if close_cols:
+                close_col = close_cols[0]  # Take the first match
+                current_price = stock_data[close_col].iloc[-1]  # Use iloc for positional indexing
+                logger.info(f"Using MultiIndex column {close_col} for close price.")
+            else:
+                # Fallback to the first column if no Close column is found
+                logger.warning("No 'Close' column found in MultiIndex. Using first column.")
+                current_price = stock_data.iloc[:, 0].iloc[-1]
+        else:
+            # Regular single-level columns
+            current_price = stock_data['Close'].iloc[-1]
+        
+        logger.info(f"Current price: ${current_price:.2f}")
+    except Exception as e:
+        # Provide a detailed error message and fallback value
+        logger.error(f"Error retrieving current price: {e}")
+        logger.error(f"Available columns: {stock_data.columns.tolist()}")
+        logger.error(f"Using fallback current price of $1.00")
+        current_price = 1.00
+    
+    # Calculate next 5 trading days
+    today = datetime.now()
+    next_days = []
+    day_count = 0
+    for i in range(1, 8):  # Look ahead up to 7 calendar days to find 5 trading days
+        next_day = today + timedelta(days=i)
+        if next_day.weekday() < 5:  # Monday to Friday (0-4)
+            next_days.append(next_day.strftime('%Y-%m-%d'))
+            day_count += 1
+            if day_count >= args.prediction_horizon:
+                break
+    
+    # Create trading recommendations
+    trading_agent = TradingAgent(
+        model=model,
+        price_scaler=preprocessor.price_scaler,
+        initial_capital=args.initial_capital,
+        transaction_fee=args.transaction_fee
+    )
+    
+    recommendations = []
+    for i in range(args.prediction_horizon):
+        pred_price = predictions[0][i]
+        price_change = (pred_price - current_price) / current_price * 100
+        
+        if price_change > 2:
+            action = "BUY"
+        elif price_change < -2:
+            action = "SELL"
+        else:
+            action = "HOLD"
+        
+        recommendations.append({
+            'date': next_days[i],
+            'predicted_price': pred_price,
+            'change_percent': price_change,
+            'recommendation': action
+        })
+    
+    # Display recommendations
+    rec_df = pd.DataFrame(recommendations)
+    print("\nTrading Recommendations for Next 5 Trading Days:")
+    print(rec_df.to_string(index=False))
+    
+    # Save recommendations
+    results_dir = os.path.join(os.path.dirname(__file__), "results")
+    os.makedirs(results_dir, exist_ok=True)
+    rec_df.to_csv(os.path.join(results_dir, f'recommendations_{datetime.now().strftime("%Y%m%d")}.csv'), index=False)
+    
+    # Visualize predictions
+    plt.figure(figsize=(10, 6))
+    
+    # Plot historical data (last 30 days)
+    hist_dates = stock_data.index[-30:]
+    hist_prices = stock_data['Close'][-30:].values
+    plt.plot(range(len(hist_dates)), hist_prices, 'b-', label='Historical')
+    
+    # Plot predictions
+    pred_prices = predictions[0]
+    plt.plot(range(len(hist_dates), len(hist_dates) + len(pred_prices)), 
+             pred_prices, 'r--', label='Predicted')
+    
+    # Set x-axis labels
+    all_dates = np.concatenate([hist_dates.strftime('%Y-%m-%d').values, next_days])
+    plt.xticks(range(0, len(all_dates), 5), all_dates[::5], rotation=45)
+    
+    plt.title('Tesla Stock Price Prediction')
+    plt.xlabel('Date')
+    plt.ylabel('Price ($)')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    
+    # Save plot
+    plt.savefig(os.path.join(results_dir, f'prediction_chart_{datetime.now().strftime("%Y%m%d")}.png'))
+    plt.close()
+    
+    return rec_df
 
 def main():
-    # Set paths
-    data_path = "data/raw/TSLA.csv"
-    model_path = "models/advanced_model.joblib"
-    results_path = "results"
+    """Main execution function"""
+    args = parse_arguments()
     
-    # Create directories if they don't exist
-    os.makedirs(os.path.dirname(model_path), exist_ok=True)
-    os.makedirs(results_path, exist_ok=True)
+    try:
+        if args.mode == 'train':
+            model, preprocessor, X_test, y_test = train_model(args)
+            
+            # Also run test after training
+            test_model(args, model, preprocessor)
+            
+        elif args.mode == 'test':
+            test_model(args)
+            
+        elif args.mode == 'trade':
+            trade(args)
+            
+        else:
+            logger.error(f"Unknown mode: {args.mode}")
     
-    # Step 1: Preprocess data
-    print("Preprocessing data...")
-    sequence_length = 10
-    X_train, X_test, y_train, y_test, scaler, processed_data = preprocess_data(data_path, sequence_length)
-    
-    # Step 2: Train or load model
-    print("Loading model...")
-    if os.path.exists(model_path):
-        print(f"Loading existing model from {model_path}")
-        model = StockPredictionModel(sequence_length, X_train.shape[2])
-        model.load(model_path)
+    except Exception as e:
+        logger.error(f"Error during execution: {e}", exc_info=True)
+        return 1
         
-        # Check if model has direction classifier
-        has_direction_classifier = hasattr(model, 'direction_classifier') and model.direction_classifier is not None
-        if has_direction_classifier:
-            print(f"Model includes direction classifier (version: {getattr(model, 'direction_classifier_version', 'unknown')})")
-        else:
-            print("Model does not have a direction classifier")
-    else:
-        print("Model not found. Please train a model first using train_advanced_model.py or train_direction_focused_model.py")
-        print("Example: python src/models/train_direction_focused_model.py --epochs 20 --direction-focus")
-        return
-    
-    # Test direction prediction accuracy (optional - uncomment to run)
-    # test_direction_prediction_accuracy(model_path)
-    
-    # Step 3: Initialize trading agent
-    print("Initializing trading agent...")
-    agent = TradingAgent(model, scaler)
-    
-    # Step 4: Generate next 5 trading days dates
-    print("Generating forecast for next 5 trading days...")
-    last_trading_day = get_last_trading_day()
-    future_dates = generate_future_trading_days(last_trading_day, 5)
-    
-    print(f"Last trading day: {last_trading_day.strftime('%Y-%m-%d')}")
-    print(f"Future trading days: {[d.strftime('%Y-%m-%d') for d in future_dates]}")
-    
-    # Step 5: Create forecaster and generate future data
-    feature_columns = ['Close', 'Volume', 'MA5', 'MA10', 'MA20', 'RSI', 
-                      'MACD', 'MACD_signal', 'BB_upper', 'BB_lower', 'Volatility', 'Return']
-    
-    forecaster = StockForecaster(model, scaler, sequence_length, feature_columns)
-    
-    # Add is_forecast flag to processed data
-    processed_data['is_forecast'] = False
-    
-    # Generate forecast data
-    forecast_data = forecaster.forecast_next_days(processed_data, future_dates)
-    
-    # Combine historical and forecast data
-    combined_data = pd.concat([processed_data, forecast_data], ignore_index=True)
-    
-    # Step 6: Run simulation for future dates
-    print("Running trading simulation for future dates...")
-    start_date = future_dates[0]
-    end_date = future_dates[-1]
-    
-    print(f"Simulation period: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
-    
-    simulation = TradingSimulation(agent, combined_data, sequence_length, start_date, end_date)
-    results = simulation.run_simulation()
-    
-    # Make sure we have valid results before continuing
-    if results.empty:
-        print("Error: No data available for simulation in the selected date range.")
-        return
-    
-    # Step 7: Visualize and save results
-    print("Generating performance summary...")
-    performance = simulation.get_performance_summary()
-    
-    print("\n===== Performance Summary (FORECAST) =====")
-    for key, value in performance.items():
-        if 'pct' in key:
-            print(f"{key}: {value:.2f}%")
-        elif 'value' in key or 'balance' in key or 'fees' in key:
-            print(f"{key}: ${value:.2f}")
-        else:
-            print(f"{key}: {value}")
-    
-    # Save results
-    results.to_csv(os.path.join(results_path, "forecast_results.csv"), index=False)
-    
-    # Plot results
-    print("Plotting results...")
-    simulation.plot_results(save_path=os.path.join(results_path, "forecast_plot.png"))
-    
-    # After running simulation and plotting results:
-    
-    # Create strategy comparison
-    print("\nComparing trading strategies...")
-    historical_data = processed_data[processed_data['is_forecast'] == False].copy()
-    strategy_results, strategy_performance = compare_strategies(
-        historical_data, 
-        forecast_data,
-        agent_results=results,
-        save_path=os.path.join(results_path, "strategy_comparison.png")
-    )
-    
-    # Create comprehensive dashboard
-    print("\nGenerating dashboard...")
-    create_dashboard(
-        historical_data.tail(30),  # Last 30 days of historical data
-        forecast_data,
-        results,
-        performance,
-        save_path=os.path.join(results_path, "dashboard.png")
-    )
-    
-    print("\nAll visualizations and comparisons complete!")
-    
+    return 0
+
 if __name__ == "__main__":
-    main()
+    exit(main())
