@@ -125,11 +125,24 @@ CSV file from Yahoo Finance named `TSLA.csv` with columns:
 - `Volume`
 
 ## Usage
-1. **Installation**: Install dependencies with `pip install -r requirements.txt`
-2. **Training**: Run `python main.py --mode train` to train the model
-3. **Testing**: Run `python main.py --mode test` to test on historical data
-4. **Trading**: Run `python main.py --mode trade` to get recommendations for the next 5 trading days
-5. **Optional Parameters**:
+1. **Virtual Environment Setup**:
+   ```
+   # Create a virtual environment using Python 3.10
+   python3.10 -m venv venv
+   
+   # Activate the virtual environment
+   # On Windows:
+   venv\Scripts\activate
+   
+   # On macOS/Linux:
+   # source venv/bin/activate
+   ```
+
+2. **Installation**: Install dependencies with `pip install -r requirements.txt`
+3. **Training**: Run `python main.py --mode train` to train the model
+4. **Testing**: Run `python main.py --mode test` to test on historical data
+5. **Trading**: Run `python main.py --mode trade` to get recommendations for the next 5 trading days
+6. **Optional Parameters**:
    - `--window-size`: Size of sliding window in days (default: 30)
    - `--prediction-horizon`: Days to predict ahead (default: 5)
    - `--initial-capital`: Starting investment amount (default: 10000)

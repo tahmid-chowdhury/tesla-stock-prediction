@@ -1,0 +1,46 @@
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Data files
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# Model files
+models/*.h5
+models/*.keras
+models/*.pb
+
+# Results
+results/*
+!results/.gitkeep
+
+# Logs
+*.log
+logs/
+
+# IDE specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# OS specific files
+.DS_Store
+Thumbs.db
