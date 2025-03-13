@@ -10,7 +10,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 class TradingAgent:
     def __init__(self, model, price_scaler, initial_capital=10000, transaction_fee=0.01, risk_factor=0.3,
                  stop_loss_pct=5.0, trailing_stop_pct=None, max_trades_per_day=2,
-                 max_drawdown_pct=20.0, volatility_scaling=True):
+                 max_drawdown_pct=20.0, volatility_scaling=True, window_size=30, prediction_horizon=5):
         """
         Initialize the trading agent
         
@@ -25,6 +25,8 @@ class TradingAgent:
             max_trades_per_day: Maximum number of trades allowed per day
             max_drawdown_pct: Maximum allowable portfolio drawdown before halting trading
             volatility_scaling: Whether to adjust stop-loss based on market volatility
+            window_size: Size of sliding window in days (default: 30)
+            prediction_horizon: Days to predict ahead (default: 5)
         """
         self.model = model
         self.price_scaler = price_scaler
@@ -39,6 +41,13 @@ class TradingAgent:
         self.transaction_history = []
         self.portfolio_history = []
         self.results_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "results")
+        
+        # Window and prediction configuration
+        self.window_size = window_size
+        self.prediction_horizon = prediction_horizon
+        
+        # Prediction tracking for evaluation
+        self.prediction_history = []
         
         # Stop loss tracking variables
         self.purchase_price = 0  # Price at which shares were purchased
@@ -153,7 +162,8 @@ class TradingAgent:
         
         # Update trend buffer if we have history
         if price_history is not None and len(price_history) > 1:
-            self.trend_buffer = price_history[-10:] if len(price_history) >= 10 else price_history
+            # Ensure we're using at most the last 30 days (window_size) of data
+            self.trend_buffer = price_history[-self.window_size:] if len(price_history) >= self.window_size else price_history
             
             # Update stop-loss percentage based on volatility
             if self.volatility_scaling:
@@ -423,6 +433,14 @@ class TradingAgent:
             # Make prediction for next 5 days
             predicted_prices = self.predict_prices(np.array([test_data[i]]))
             
+            # Track predictions for evaluation
+            self.prediction_history.append({
+                'date': current_date,
+                'actual_price': current_price,
+                'predicted_next_day': predicted_prices[0],
+                'predicted_5_day': predicted_prices[-1] if len(predicted_prices) >= 5 else predicted_prices[-1],
+            })
+            
             # Decide action with all required parameters
             action, amount = self.decide_action(
                 current_price=current_price,
@@ -493,6 +511,13 @@ class TradingAgent:
             plt.savefig(os.path.join(self.results_dir, 'portfolio_value.png'))
             plt.close()
             
+            # Save prediction performance
+            if self.prediction_history:
+                predictions_df = pd.DataFrame(self.prediction_history)
+                predictions_path = os.path.join(self.results_dir, 'predictions.csv') 
+                predictions_df.to_csv(predictions_path, index=False)
+                logging.info(f"Prediction history saved to {predictions_path}")
+            
             # Plot transactions
             buy_dates = [t['timestamp'] for t in self.transaction_history if t['action'] == 'buy']
             buy_prices = [t['price'] for t in self.transaction_history if t['action'] == 'buy']
@@ -502,9 +527,21 @@ class TradingAgent:
             
             plt.figure(figsize=(12, 6))
             plt.plot(portfolio_df['date'], portfolio_df['price'], label='Stock Price')
+            
+            # Plot predictions if available
+            if self.prediction_history:
+                pred_df = pd.DataFrame(self.prediction_history)
+                if not pred_df.empty:
+                    # Only plot some predictions to avoid clutter
+                    step = max(1, len(pred_df) // 10)
+                    plt.plot(pred_df['date'][::step], 
+                             pred_df['predicted_next_day'][::step], 
+                             'o--', color='purple', alpha=0.7, 
+                             label='Price Predictions (Next Day)')
+            
             plt.scatter(buy_dates, buy_prices, color='green', marker='^', label='Buy')
             plt.scatter(sell_dates, sell_prices, color='red', marker='v', label='Sell')
-            plt.title('Trading Decisions')
+            plt.title('Trading Decisions with Predictions')
             plt.xlabel('Date')
             plt.ylabel('Price ($)')
             plt.legend()
@@ -512,3 +549,51 @@ class TradingAgent:
             plt.tight_layout()
             plt.savefig(os.path.join(self.results_dir, 'trading_decisions.png'))
             plt.close()
+            
+            # Add prediction accuracy metrics
+            if self.prediction_history:
+                plt.figure(figsize=(12, 6))
+                pred_df = pd.DataFrame(self.prediction_history)
+                
+                if not pred_df.empty and len(pred_df) > 1:
+                    # Get actual next day prices by shifting
+                    pred_df['next_day_actual'] = pred_df['actual_price'].shift(-1)
+                    
+                    # Drop the last row which has NaN in next_day_actual
+                    pred_df = pred_df.dropna()
+                    
+                    if not pred_df.empty:
+                        # Calculate prediction errors
+                        pred_df['prediction_error'] = pred_df['predicted_next_day'] - pred_df['next_day_actual']
+                        pred_df['error_pct'] = (pred_df['prediction_error'] / pred_df['next_day_actual']) * 100
+                        
+                        # Plot prediction errors
+                        plt.plot(pred_df['date'], pred_df['error_pct'])
+                        plt.axhline(y=0, color='r', linestyle='-', alpha=0.3)
+                        plt.title('Prediction Error Percentage Over Time')
+                        plt.xlabel('Date')
+                        plt.ylabel('Error (%)')
+                        plt.xticks(rotation=45)
+                        plt.tight_layout()
+                        plt.savefig(os.path.join(self.results_dir, 'prediction_errors.png'))
+                        plt.close()
+                        
+                        # Calculate and save accuracy metrics
+                        mse = np.mean(pred_df['prediction_error'] ** 2)
+                        rmse = np.sqrt(mse)
+                        mae = np.mean(np.abs(pred_df['prediction_error']))
+                        mape = np.mean(np.abs(pred_df['error_pct']))
+                        
+                        directional_accuracy = np.mean(
+                            (pred_df['predicted_next_day'] > pred_df['actual_price']) == 
+                            (pred_df['next_day_actual'] > pred_df['actual_price'])
+                        ) * 100
+                        
+                        with open(os.path.join(self.results_dir, 'prediction_metrics.txt'), 'w') as f:
+                            f.write(f"Mean Squared Error: {mse:.4f}\n")
+                            f.write(f"Root Mean Squared Error: {rmse:.4f}\n")
+                            f.write(f"Mean Absolute Error: {mae:.4f}\n")
+                            f.write(f"Mean Absolute Percentage Error: {mape:.2f}%\n")
+                            f.write(f"Directional Accuracy: {directional_accuracy:.2f}%\n")
+                        
+                        logging.info(f"Prediction metrics saved to {os.path.join(self.results_dir, 'prediction_metrics.txt')}")
