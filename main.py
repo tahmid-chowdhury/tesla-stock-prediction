@@ -188,10 +188,19 @@ def trade(args):
     
     # Load fresh data
     data_loader = DataLoader("TSLA", api_key=args.newsapi_key)
+    
+    # Set a more reasonable date range - last 365 days
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=365)
+    
     stock_data = data_loader.fetch_stock_data(
-        start_date=(datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d'),
-        end_date=datetime.now().strftime('%Y-%m-%d')
+        start_date=start_date.strftime('%Y-%m-%d'),
+        end_date=end_date.strftime('%Y-%m-%d')
     )
+    
+    if args.newsapi_key:
+        # Use a smaller window for news data to respect API limits
+        data_loader.fetch_news_data(days_back=30)
     
     # Process data
     preprocessor = Preprocessor(

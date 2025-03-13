@@ -45,37 +45,42 @@ class DataLoader:
             logging.error(f"Error fetching stock data: {e}")
             return None
     
-    def fetch_news_data(self, days=30):
+    # Improve news data fetching to handle API limitations
+    def fetch_news_data(self, days_back=30):
         """
-        Fetch news related to the ticker using NewsAPI
+        Fetch news data for a ticker using NewsAPI
+        
+        Args:
+            days_back: Number of days to look back (default: 30 for free tier limitation)
         """
         if not self.api_key:
-            logging.warning("No NewsAPI key provided. Skipping news data.")
+            logging.warning("No NewsAPI key provided. Skipping news data retrieval.")
             return None
             
-        newsapi = NewsApiClient(api_key=self.api_key)
+        # Calculate date range (limit to 30 days for free API tier)
+        end_date = datetime.now()
+        # Free tier of NewsAPI typically only allows 30 days back
+        start_date = end_date - timedelta(days=min(days_back, 30))
+        
+        logging.info(f"Fetching news for {self.ticker} from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
         
         try:
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=days)
-            
-            logging.info(f"Fetching news for {self.ticker} from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
-            
-            news = newsapi.get_everything(
-                q=f"{self.ticker} OR Tesla",
+            newsapi = NewsApiClient(api_key=self.api_key)
+            all_articles = newsapi.get_everything(
+                q=self.ticker,
                 from_param=start_date.strftime('%Y-%m-%d'),
                 to=end_date.strftime('%Y-%m-%d'),
                 language='en',
                 sort_by='publishedAt'
             )
             
-            # Save news data to JSON
-            json_path = os.path.join(self.raw_dir, f"{self.ticker}_news.json")
-            with open(json_path, 'w') as f:
-                json.dump(news, f)
-            logging.info(f"News data saved to {json_path}")
-            
-            return news
+            # Save the data
+            news_path = os.path.join(self.raw_dir, f"{self.ticker}_news.json")
+            with open(news_path, 'w') as f:
+                json.dump(all_articles, f)
+                
+            logging.info(f"News data saved to {news_path}")
+            return all_articles
         except Exception as e:
             logging.error(f"Error fetching news data: {e}")
             return None

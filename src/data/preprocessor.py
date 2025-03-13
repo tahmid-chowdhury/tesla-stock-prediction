@@ -163,6 +163,7 @@ class Preprocessor:
             logging.error(f"Error processing news data: {e}")
             return stock_data
     
+    # Improve handling of MultiIndex columns
     def prepare_data(self, stock_data):
         """
         Main function to prepare data for model training
@@ -173,13 +174,34 @@ class Preprocessor:
         except Exception as e:
             logging.error(f"Error in news sentiment processing: {e}")
         
+        # Handle MultiIndex columns if present
+        if isinstance(stock_data.columns, pd.MultiIndex):
+            # Convert MultiIndex to single level using the first level
+            close_cols = [col for col in stock_data.columns if 'Close' in col[0]]
+            if close_cols:
+                # Create a standardized DataFrame with single-level column names
+                renamed_data = {}
+                for name in ['Close', 'Open', 'High', 'Low', 'Volume']:
+                    col_matches = [col for col in stock_data.columns if name in col[0]]
+                    if col_matches:
+                        renamed_data[name] = stock_data[col_matches[0]]
+                
+                # Create new DataFrame with standard column names
+                df = pd.DataFrame(renamed_data, index=stock_data.index)
+                logging.info(f"Converted MultiIndex columns to standard format. New shape: {df.shape}")
+            else:
+                logging.error("Could not find required columns in MultiIndex DataFrame")
+                df = stock_data.copy()
+        else:
+            df = stock_data.copy()
+        
         # Add technical indicators
-        df = self.add_technical_indicators(stock_data)
+        df = self.add_technical_indicators(df)
         logging.info(f"Added technical indicators. Shape: {df.shape}")
         
         # Ensure consistent column naming for 'Close'
         if 'Close' not in df.columns:
-            close_cols = [col for col in df.columns if str(col).lower() == 'close']
+            close_cols = [col for col in df.columns if isinstance(col, str) and col.lower() == 'close']
             if close_cols:
                 # Rename the column to 'Close'
                 df = df.rename(columns={close_cols[0]: 'Close'})

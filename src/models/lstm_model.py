@@ -7,6 +7,7 @@ from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 import matplotlib.pyplot as plt
 import logging
+from datetime import datetime  # Add import for datetime
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -96,7 +97,7 @@ class LSTMModel:
         )
         
         # Save the final model
-        self.model.save(os.path.join(self.models_dir, "lstm_final.h5"))
+        self.save_model()
         logging.info("Model trained and saved successfully")
         
         # Plot training history
@@ -115,40 +116,55 @@ class LSTMModel:
         predictions = self.model.predict(X)
         return predictions
         
+    def save_model(self, custom_filename=None):
+        """
+        Save the trained model
+        """
+        try:
+            if not os.path.exists(self.models_dir):
+                os.makedirs(self.models_dir)
+                
+            if custom_filename:
+                model_path = os.path.join(self.models_dir, custom_filename)
+            else:
+                # Use .keras extension instead of .h5
+                model_path = os.path.join(self.models_dir, f"lstm_model_{datetime.now().strftime('%Y%m%d')}.keras")
+                
+            self.model.save(model_path)
+            logging.info(f"Model saved to {model_path}")
+            return model_path
+        except Exception as e:
+            logging.error(f"Failed to save model: {e}")
+            return None
+
     def load_saved_model(self, model_path=None):
         """
-        Load a saved model
+        Load a previously saved model
         """
-        if model_path is None:
-            model_path = os.path.join(self.models_dir, "lstm_best.h5")
-            
-        if not os.path.exists(model_path):
-            logging.error(f"Model file {model_path} not found")
-            return False
-            
         try:
-            # Custom objects to handle serialization issues
-            custom_objects = {
-                'mse': tf.keras.losses.MeanSquaredError(),
-                'mae': tf.keras.metrics.MeanAbsoluteError()
-            }
-            self.model = load_model(model_path, custom_objects=custom_objects)
-            logging.info(f"Model loaded from {model_path}")
+            if model_path:
+                path_to_load = model_path
+            else:
+                # Try to find the most recent model file (either .h5 or .keras)
+                model_files = [f for f in os.listdir(self.models_dir) 
+                              if f.endswith('.h5') or f.endswith('.keras')]
+                
+                if not model_files:
+                    logging.error("No model files found in models directory")
+                    return False
+                    
+                # Sort by modification time (most recent first)
+                model_files.sort(key=lambda x: os.path.getmtime(os.path.join(self.models_dir, x)), 
+                                reverse=True)
+                path_to_load = os.path.join(self.models_dir, model_files[0])
+            
+            logging.info(f"Loading model from {path_to_load}")
+            self.model = tf.keras.models.load_model(path_to_load)
             return True
         except Exception as e:
-            logging.error(f"Error loading model: {e}")
-            # Try to rebuild and compile the model as a fallback
-            try:
-                logging.info("Attempting to rebuild and compile the model...")
-                if self.feature_dim is None:
-                    self.feature_dim = 20  # Default value based on processed data
-                self.build_model()
-                logging.info("Model rebuilt successfully. Note: The model will not have trained weights.")
-                return True
-            except Exception as rebuild_err:
-                logging.error(f"Failed to rebuild model: {rebuild_err}")
-                return False
-    
+            logging.error(f"Failed to load model: {e}")
+            return False
+
     def evaluate(self, X_test, y_test, price_scaler=None):
         """
         Evaluate model performance on test data

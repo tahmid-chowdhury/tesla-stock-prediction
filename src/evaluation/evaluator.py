@@ -3,8 +3,16 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
-import seaborn as sns
 import logging
+
+# Try to import seaborn, but don't fail if it's not available
+try:
+    import seaborn as sns
+    SEABORN_AVAILABLE = True
+except ImportError:
+    logging.warning("Seaborn is not installed. Using matplotlib for visualizations instead.")
+    logging.warning("For better visualizations, install seaborn using: pip install seaborn")
+    SEABORN_AVAILABLE = False
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -145,9 +153,30 @@ class ModelEvaluator:
         
         # Plot confusion matrix
         plt.figure(figsize=(8, 6))
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                    xticklabels=['Sell', 'Hold', 'Buy'],
-                    yticklabels=['Sell', 'Hold', 'Buy'])
+        
+        # Use seaborn if available, otherwise use matplotlib
+        if SEABORN_AVAILABLE:
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                      xticklabels=['Sell', 'Hold', 'Buy'],
+                      yticklabels=['Sell', 'Hold', 'Buy'])
+        else:
+            # Create a simple heatmap with matplotlib
+            plt.imshow(cm, interpolation='nearest', cmap='Blues')
+            plt.colorbar()
+            
+            # Add labels and values to the plot
+            tick_marks = np.arange(len(['Sell', 'Hold', 'Buy']))
+            plt.xticks(tick_marks, ['Sell', 'Hold', 'Buy'], rotation=45)
+            plt.yticks(tick_marks, ['Sell', 'Hold', 'Buy'])
+            
+            # Add text annotations for values
+            thresh = cm.max() / 2.
+            for i in range(cm.shape[0]):
+                for j in range(cm.shape[1]):
+                    plt.text(j, i, format(cm[i, j], 'd'),
+                            ha="center", va="center",
+                            color="white" if cm[i, j] > thresh else "black")
+        
         plt.title('Confusion Matrix')
         plt.ylabel('True Label')
         plt.xlabel('Predicted Label')

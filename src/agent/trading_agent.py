@@ -8,7 +8,7 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class TradingAgent:
-    def __init__(self, model, price_scaler, initial_capital=10000, transaction_fee=0.01):
+    def __init__(self, model, price_scaler, initial_capital=10000, transaction_fee=0.01, risk_factor=0.3):
         """
         Initialize the trading agent
         
@@ -17,12 +17,14 @@ class TradingAgent:
             price_scaler: Scaler for price data
             initial_capital: Initial investment amount
             transaction_fee: Fee per transaction (as a percentage)
+            risk_factor: Risk factor for position sizing (0.1-0.5)
         """
         self.model = model
         self.price_scaler = price_scaler
         self.initial_capital = initial_capital
         self.current_capital = initial_capital
         self.transaction_fee = transaction_fee
+        self.risk_factor = risk_factor  # Add risk factor parameter
         self.shares_owned = 0
         self.transaction_history = []
         self.portfolio_history = []
@@ -69,29 +71,53 @@ class TradingAgent:
             # Return some default values
             return np.ones(5) * current_data[0][-1][0]  # Use the last known price
     
-    def decide_action(self, current_price, predicted_prices, risk_factor=0.3):
+    # Improve trading decision logic to reduce losses
+    def decide_action(self, current_price, predicted_price, available_capital, current_shares):
         """
-        Decide trading action based on price predictions
+        Decide trading action based on prediction
+        
+        Args:
+            current_price: Current stock price
+            predicted_price: Predicted stock price
+            available_capital: Available cash
+            current_shares: Current number of shares owned
         
         Returns:
             action: 'buy', 'sell', or 'hold'
-            amount: Proportion of capital to use (for buy) or shares to sell
+            quantity: Number of shares to buy or sell
         """
         # Calculate price change percentage
-        price_change = (predicted_prices[0] - current_price) / current_price
+        price_change = (predicted_price - current_price) / current_price * 100
         
-        # Decision rules based on README
-        if price_change > 0.02:  # Price increase > 2%
-            action = 'buy'
-            amount = risk_factor * self.current_capital
-        elif price_change < -0.02:  # Price decrease > 2%
-            action = 'sell'
-            amount = self.shares_owned if price_change < -0.05 else self.shares_owned * 0.5
-        else:
-            action = 'hold'
-            amount = 0
+        # More conservative thresholds
+        buy_threshold = 3.0  # Changed from 2.0
+        sell_threshold = -3.0  # Changed from -2.0
+        
+        # Risk-adjusted position sizing
+        max_position = min(0.5, self.risk_factor)  # Cap at 50% of capital
+        
+        if price_change > buy_threshold and available_capital > current_price:
+            # Buy signal
+            # Calculate the position size based on conviction (stronger signal = larger position)
+            conviction = min(price_change / 10, 1.0)  # Scale conviction, max at 10% predicted increase
+            position_size = available_capital * max_position * conviction
             
-        return action, amount
+            # Ensure we don't spend more than available
+            max_shares = int(position_size / (current_price * (1 + self.transaction_fee)))
+            quantity = max(1, min(max_shares, int(available_capital / (current_price * (1 + self.transaction_fee)))))
+            
+            return 'buy', quantity
+            
+        elif price_change < sell_threshold and current_shares > 0:
+            # Sell signal
+            # Stronger conviction = sell more shares
+            conviction = min(abs(price_change) / 10, 1.0)
+            quantity = max(1, int(current_shares * conviction))
+            
+            return 'sell', quantity
+        
+        # Hold by default
+        return 'hold', 0
     
     def execute_trade(self, action, amount, current_price, timestamp):
         """
@@ -204,8 +230,13 @@ class TradingAgent:
             # Make prediction for next 5 days
             predicted_prices = self.predict_prices(np.array([test_data[i]]))
             
-            # Decide action
-            action, amount = self.decide_action(current_price, predicted_prices)
+            # Decide action with all required parameters
+            action, amount = self.decide_action(
+                current_price=current_price,
+                predicted_price=predicted_prices[0],
+                available_capital=self.current_capital,
+                current_shares=self.shares_owned
+            )
             
             # Execute trade using the NEXT day's price (simulating real trading)
             self.execute_trade(action, amount, next_price, next_date)
