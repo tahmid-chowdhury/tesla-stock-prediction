@@ -4,6 +4,10 @@ import pandas as pd
 import argparse
 import logging
 from datetime import datetime, timedelta
+
+# Set matplotlib backend to 'Agg' for non-interactive use to avoid Tkinter errors
+import matplotlib
+matplotlib.use('Agg')  # Must be before importing pyplot
 import matplotlib.pyplot as plt
 
 # Import custom modules
@@ -25,6 +29,10 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+def close_all_figures():
+    """Helper function to properly close all matplotlib figures to avoid Tkinter errors"""
+    plt.close('all')
 
 def parse_arguments():
     """Parse command line arguments"""
@@ -75,7 +83,7 @@ def parse_arguments():
     
     parser.add_argument('--max-drawdown', type=float, default=20.0,
                         help='Maximum drawdown percentage before halting trading')
-                        
+    
     parser.add_argument('--volatility-scaling', action='store_true',
                         help='Enable volatility-based stop-loss scaling')
     
@@ -274,6 +282,9 @@ def test_model(args, model=None, preprocessor=None):
             final_trade=True
         )
         
+        # Ensure all plots are properly closed
+        close_all_figures()
+        
         # Evaluate trading performance
         evaluator = ModelEvaluator()
         transactions_df = pd.DataFrame(agent.transaction_history)
@@ -286,6 +297,8 @@ def test_model(args, model=None, preprocessor=None):
         return agent
     except Exception as e:
         logger.error(f"Error during testing simulation: {e}")
+        # Make sure to close figures even if there's an error
+        close_all_figures()
         return None
 
 def trade(args):
@@ -313,6 +326,7 @@ def trade(args):
         window_size=args.window_size,
         prediction_horizon=args.prediction_horizon
     )
+    
     preprocessor.prepare_data(stock_data)
     
     # Load model
@@ -365,6 +379,7 @@ def trade(args):
     today = datetime.now()
     next_days = []
     day_count = 0
+    
     for i in range(1, 8):  # Look ahead up to 7 calendar days to find 5 trading days
         next_day = today + timedelta(days=i)
         if next_day.weekday() < 5:  # Monday to Friday (0-4)
@@ -417,7 +432,7 @@ def trade(args):
     hist_dates = stock_data.index[-30:]
     hist_prices = stock_data['Close'][-30:].values
     plt.plot(range(len(hist_dates)), hist_prices, 'b-', label='Historical')
-    
+     
     # Plot predictions
     pred_prices = predictions[0]
     plt.plot(range(len(hist_dates), len(hist_dates) + len(pred_prices)), 
@@ -432,6 +447,7 @@ def trade(args):
     plt.ylabel('Price ($)')
     plt.legend()
     plt.grid(True)
+    
     plt.tight_layout()
     
     # Save plot
@@ -463,6 +479,9 @@ def main():
     except Exception as e:
         logger.error(f"Error during execution: {e}", exc_info=True)
         return 1
+    finally:
+        # Ensure all matplotlib figures are closed properly to prevent Tkinter errors
+        close_all_figures()
         
     return 0
 
