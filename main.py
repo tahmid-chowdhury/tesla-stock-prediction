@@ -87,6 +87,16 @@ def parse_arguments():
     parser.add_argument('--volatility-scaling', action='store_true',
                         help='Enable volatility-based stop-loss scaling')
     
+    # New arguments for sentiment analysis
+    parser.add_argument('--use-sentiment', action='store_true', default=True,
+                        help='Use news sentiment analysis in the model')
+    
+    parser.add_argument('--sentiment-weight', type=float, default=0.3,
+                        help='Weight for sentiment influence on trading decisions (0.0-1.0)')
+    
+    parser.add_argument('--sentiment-days', type=int, default=30,
+                        help='Number of days of news to fetch for sentiment analysis')
+    
     return parser.parse_args()
 
 def train_model(args):
@@ -109,8 +119,10 @@ def train_model(args):
     else:
         stock_data = data_loader.fetch_stock_data()
     
-    if args.newsapi_key:
-        data_loader.fetch_news_data()
+    # Fetch news data if API key is provided and sentiment analysis is enabled
+    if args.newsapi_key and args.use_sentiment:
+        logger.info(f"Fetching news data for sentiment analysis (past {args.sentiment_days} days)")
+        data_loader.fetch_news_data(days_back=args.sentiment_days)
     
     # Debug the column structure before processing
     if isinstance(stock_data.columns, pd.MultiIndex):
@@ -145,6 +157,17 @@ def train_model(args):
             X_train, X_test, y_train, y_test = preprocessor.prepare_data(stock_data)
         else:
             raise
+    
+    # Check for sentiment features
+    sentiment_features = []
+    try:
+        processed_dir = os.path.join(os.path.dirname(__file__), "data", "processed")
+        sentiment_features_path = os.path.join(processed_dir, "sentiment_columns.npy")
+        if (os.path.exists(sentiment_features_path)):
+            sentiment_features = np.load(sentiment_features_path, allow_pickle=True)
+            logger.info(f"Loaded {len(sentiment_features)} sentiment features: {sentiment_features}")
+    except Exception as e:
+        logger.warning(f"Could not load sentiment features: {e}")
     
     # Hyperparameter tuning if requested
     if args.tune:
@@ -209,8 +232,13 @@ def test_model(args, model=None, preprocessor=None):
     
     if model is None or preprocessor is None:
         # Load data if not provided
-        data_loader = DataLoader("TSLA")
+        data_loader = DataLoader("TSLA", api_key=args.newsapi_key)
         stock_data = data_loader.fetch_stock_data()
+        
+        # Fetch news data for sentiment if requested
+        if args.newsapi_key and args.use_sentiment:
+            logger.info(f"Fetching news data for testing (past {args.sentiment_days} days)")
+            data_loader.fetch_news_data(days_back=args.sentiment_days)
         
         preprocessor = Preprocessor(
             window_size=args.window_size,
@@ -259,7 +287,7 @@ def test_model(args, model=None, preprocessor=None):
         model=model,
         price_scaler=preprocessor.price_scaler,
         initial_capital=args.initial_capital,
-        transaction_fee=args.transaction_fee,
+        transaction_fee=args.transaction_fee / 100,  # Convert from percentage to decimal
         risk_factor=args.risk_factor,
         stop_loss_pct=args.stop_loss,
         trailing_stop_pct=args.trailing_stop,
@@ -268,17 +296,35 @@ def test_model(args, model=None, preprocessor=None):
         volatility_scaling=args.volatility_scaling
     )
     
+    # Set sentiment influence if using sentiment
+    if hasattr(agent, 'sentiment_influence') and args.use_sentiment:
+        agent.sentiment_influence = args.sentiment_weight
+        logger.info(f"Using sentiment in trading decisions with weight: {args.sentiment_weight}")
+    
     try:
         # Load dates for test data
         data_loader = DataLoader("TSLA")
         stock_data = data_loader.fetch_stock_data()
         test_dates = stock_data.index[-len(X_test):]
         
-        # Run simulation
+        # Load sentiment data if available
+        sentiment_data = None
+        if args.use_sentiment:
+            try:
+                # Find all news sentiment columns in the stock data
+                sentiment_cols = [col for col in stock_data.columns if isinstance(col, str) and col.startswith('news_')]
+                if sentiment_cols:
+                    sentiment_data = stock_data[sentiment_cols].copy()
+                    logger.info(f"Loaded {len(sentiment_cols)} sentiment features for trading decisions")
+            except Exception as e:
+                logger.warning(f"Could not load sentiment data for trading: {e}")
+        
+        # Run simulation with sentiment data
         final_value, roi = agent.run_simulation(
             test_data=X_test,
             test_dates=test_dates,
             feature_scaler=preprocessor.feature_scaler,
+            sentiment_data=sentiment_data,
             final_trade=True
         )
         
@@ -317,9 +363,12 @@ def trade(args):
         end_date=end_date.strftime('%Y-%m-%d')
     )
     
-    if args.newsapi_key:
+    # Fetch news data if API key is provided and sentiment is enabled
+    sentiment_data = None
+    if args.newsapi_key and args.use_sentiment:
         # Use a smaller window for news data to respect API limits
-        data_loader.fetch_news_data(days_back=30)
+        logger.info(f"Fetching news data for trading (past {args.sentiment_days} days)")
+        data_loader.fetch_news_data(days_back=args.sentiment_days)
     
     # Process data
     preprocessor = Preprocessor(
@@ -328,6 +377,13 @@ def trade(args):
     )
     
     preprocessor.prepare_data(stock_data)
+    
+    # If sentiment analysis is enabled, check for sentiment features
+    if args.use_sentiment:
+        sentiment_cols = [col for col in stock_data.columns if isinstance(col, str) and col.startswith('news_')]
+        if sentiment_cols:
+            sentiment_data = stock_data[sentiment_cols].copy()
+            logger.info(f"Using {len(sentiment_cols)} sentiment features for trading recommendations")
     
     # Load model
     model = LSTMModel(
@@ -388,22 +444,51 @@ def trade(args):
             if day_count >= args.prediction_horizon:
                 break
     
-    # Create trading recommendations
+    # Get current sentiment if available
+    current_sentiment = None
+    if sentiment_data is not None and not sentiment_data.empty:
+        try:
+            # Get the most recent sentiment data point
+            current_sentiment = sentiment_data.iloc[-1].to_dict()
+            logger.info(f"Current sentiment: {current_sentiment}")
+        except Exception as e:
+            logger.warning(f"Could not retrieve current sentiment: {e}")
+    
+    # Create trading recommendations with sentiment consideration
     trading_agent = TradingAgent(
         model=model,
         price_scaler=preprocessor.price_scaler,
         initial_capital=args.initial_capital,
-        transaction_fee=args.transaction_fee
+        transaction_fee=args.transaction_fee / 100,  # Convert percentage to decimal
+        risk_factor=args.risk_factor,
+        stop_loss_pct=args.stop_loss,
+        trailing_stop_pct=args.trailing_stop,
+        volatility_scaling=args.volatility_scaling
     )
+    
+    # Set sentiment influence if using sentiment
+    if hasattr(trading_agent, 'sentiment_influence') and args.use_sentiment:
+        trading_agent.sentiment_influence = args.sentiment_weight
     
     recommendations = []
     for i in range(args.prediction_horizon):
         pred_price = predictions[0][i]
         price_change = (pred_price - current_price) / current_price * 100
         
-        if price_change > 2:
+        # Adjust price change expectation based on sentiment if available
+        sentiment_adjustment = 0
+        if current_sentiment and hasattr(trading_agent, 'sentiment_influence'):
+            if 'news_weighted_sentiment' in current_sentiment:
+                sentiment_value = current_sentiment['news_weighted_sentiment']
+                sentiment_adjustment = sentiment_value * args.sentiment_weight * 5  # Scale appropriately
+                logger.info(f"Day {i+1} sentiment adjustment: {sentiment_adjustment:.2f}%")
+            
+        adjusted_price_change = price_change + sentiment_adjustment
+        
+        # Determine action based on adjusted price change
+        if adjusted_price_change > 2:
             action = "BUY"
-        elif price_change < -2:
+        elif adjusted_price_change < -2:
             action = "SELL"
         else:
             action = "HOLD"
@@ -411,7 +496,9 @@ def trade(args):
         recommendations.append({
             'date': next_days[i],
             'predicted_price': pred_price,
-            'change_percent': price_change,
+            'raw_change_percent': price_change,
+            'sentiment_adjustment': sentiment_adjustment,
+            'adjusted_change': adjusted_price_change,
             'recommendation': action
         })
     
@@ -425,21 +512,33 @@ def trade(args):
     os.makedirs(results_dir, exist_ok=True)
     rec_df.to_csv(os.path.join(results_dir, f'recommendations_{datetime.now().strftime("%Y%m%d")}.csv'), index=False)
     
-    # Visualize predictions
+    # Visualize predictions with sentiment adjustment
     plt.figure(figsize=(10, 6))
     
     # Plot historical data (last 30 days)
     hist_dates = stock_data.index[-30:]
-    hist_prices = stock_data['Close'][-30:].values
-    plt.plot(range(len(hist_dates)), hist_prices, 'b-', label='Historical')
+    hist_prices = stock_data['Close'][-30:].values if 'Close' in stock_data.columns else None
+    
+    if hist_prices is not None:
+        plt.plot(range(len(hist_dates)), hist_prices, 'b-', label='Historical')
      
-    # Plot predictions
+    # Plot raw predictions
     pred_prices = predictions[0]
     plt.plot(range(len(hist_dates), len(hist_dates) + len(pred_prices)), 
              pred_prices, 'r--', label='Predicted')
     
+    # Plot sentiment-adjusted predictions if sentiment is available
+    if current_sentiment and args.use_sentiment:
+        adjusted_prices = pred_prices.copy()
+        for i in range(len(adjusted_prices)):
+            sentiment_adj = recommendations[i]['sentiment_adjustment'] / 100 * current_price
+            adjusted_prices[i] += sentiment_adj
+            
+        plt.plot(range(len(hist_dates), len(hist_dates) + len(adjusted_prices)),
+                 adjusted_prices, 'g:', label='Sentiment Adjusted')
+    
     # Set x-axis labels
-    all_dates = np.concatenate([hist_dates.strftime('%Y-%m-%d').values, next_days])
+    all_dates = np.concatenate([hist_dates.strftime('%Y-%m-%d').values if hist_dates is not None else [], next_days])
     plt.xticks(range(0, len(all_dates), 5), all_dates[::5], rotation=45)
     
     plt.title('Tesla Stock Price Prediction')

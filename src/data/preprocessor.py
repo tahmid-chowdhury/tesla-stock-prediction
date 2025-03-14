@@ -5,7 +5,7 @@ import logging
 import json
 from datetime import datetime, timedelta
 import ta
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.preprocessing import MinMaxScaler, StandardScaler, RobustScaler
 from sklearn.model_selection import train_test_split
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -28,6 +28,7 @@ class Preprocessor:
         self.processed_dir = os.path.join(self.data_dir, "processed")
         self.price_scaler = MinMaxScaler()
         self.feature_scaler = StandardScaler()
+        self.sentiment_scaler = RobustScaler()  # Better for sentiment data with outliers
         
         # Create directories if they don't exist
         os.makedirs(self.processed_dir, exist_ok=True)
@@ -265,9 +266,14 @@ class Preprocessor:
             news_df['date'] = news_df['publishedAt'].dt.date
             
             # Calculate sentiment for each article using TextBlob
-            def get_sentiment_scores(title, description):
-                # Combine title and description, handling None values
-                text = ' '.join(filter(None, [str(title) if title else "", str(description) if description else ""]))
+            def get_sentiment_scores(title, description, content=None):
+                # Combine title, description, and content, handling None values
+                text_parts = [
+                    str(title) if title else "",
+                    str(description) if description else "",
+                    str(content) if content else ""
+                ]
+                text = ' '.join(filter(None, text_parts))
                 if not text:
                     return 0, 0  # Neutral if no text
                 
@@ -277,18 +283,45 @@ class Preprocessor:
             
             # Apply sentiment analysis to each article
             sentiments = news_df.apply(
-                lambda x: get_sentiment_scores(x.get('title', ''), x.get('description', '')), 
+                lambda x: get_sentiment_scores(
+                    x.get('title', ''), 
+                    x.get('description', ''),
+                    x.get('content', '')  # Also include content if available
+                ), 
                 axis=1
             )
             news_df['polarity'] = [s[0] for s in sentiments]
             news_df['subjectivity'] = [s[1] for s in sentiments]
             
+            # Add sentiment magnitude (absolute value of polarity)
+            news_df['sentiment_strength'] = news_df['polarity'].abs()
+            
+            # Add sentiment category
+            def categorize_sentiment(pol):
+                if pol > 0.3:
+                    return 'very_positive'
+                elif pol > 0.1:
+                    return 'positive'
+                elif pol < -0.3:
+                    return 'very_negative'
+                elif pol < -0.1:
+                    return 'negative'
+                else:
+                    return 'neutral'
+                    
+            news_df['sentiment_category'] = news_df['polarity'].apply(categorize_sentiment)
+            
             # Group by date and calculate various sentiment metrics
             sentiment_metrics = news_df.groupby('date').agg({
                 'title': 'count',                      # Number of articles
                 'polarity': ['mean', 'std', 'min', 'max'],  # Sentiment polarity stats
-                'subjectivity': ['mean', 'max']        # Subjectivity stats
+                'subjectivity': ['mean', 'max'],       # Subjectivity stats
+                'sentiment_strength': ['mean', 'max']  # Strength of sentiment
             })
+            
+            # Count sentiment categories by date
+            sentiment_categories = pd.crosstab(news_df['date'], news_df['sentiment_category'])
+            sentiment_categories = sentiment_categories.reset_index()
             
             # Flatten the MultiIndex columns
             flat_columns = []
@@ -316,6 +349,24 @@ class Preprocessor:
                 logging.error(f"Error calculating weighted sentiment: {e}")
                 # Add a default weighted sentiment in case of error
                 sentiment_metrics['news_weighted_sentiment'] = sentiment_metrics['news_polarity_mean'] if 'news_polarity_mean' in sentiment_metrics.columns else 0
+            
+            # Add high-conviction sentiment - polarized news with high subjectivity
+            try:
+                high_conviction_sentiment = news_df.groupby('date').apply(
+                    lambda x: np.average(
+                        x['polarity'], 
+                        weights=(x['subjectivity'] * x['sentiment_strength'] + 0.1)
+                    ) if len(x) > 0 else 0
+                )
+                sentiment_metrics['news_high_conviction_sentiment'] = high_conviction_sentiment
+            except Exception as e:
+                logging.error(f"Error calculating high conviction sentiment: {e}")
+                sentiment_metrics['news_high_conviction_sentiment'] = 0
+            
+            # Add sentiment volatility - how much sentiment varies within a day
+            sentiment_metrics['news_sentiment_volatility'] = news_df.groupby('date')['polarity'].apply(
+                lambda x: x.max() - x.min() if len(x) > 1 else 0
+            )
             
             # Reset index for sentiment metrics
             sentiment_metrics = sentiment_metrics.reset_index()
@@ -375,17 +426,38 @@ class Preprocessor:
             working_df[date_col] = pd.to_datetime(working_df[date_col])
             
             # Log column information before merge
-            logging.info(f"Working DataFrame columns before merge: {working_df.columns.tolist()}")
-            logging.info(f"Sentiment metrics columns before merge: {sentiment_metrics.columns.tolist()}")
+            logging.info(f"Working DataFrame date column type: {working_df[date_col].dtype}")
+            logging.info(f"Sentiment metrics date column type: {sentiment_metrics['date'].dtype}")
+            
+            # Convert both date columns to the same format to ensure compatibility
+            working_df[date_col] = working_df[date_col].dt.date
+            sentiment_metrics['date'] = sentiment_metrics['date'].dt.date
+            
+            # Convert back to datetime for proper merging
+            working_df[date_col] = pd.to_datetime(working_df[date_col])
+            sentiment_metrics['date'] = pd.to_datetime(sentiment_metrics['date'])
             
             # Perform the merge on flattened DataFrames
-            merged_data = pd.merge(
-                working_df,
-                sentiment_metrics,
-                left_on=date_col,
-                right_on='date',
-                how='left'
-            )
+            try:
+                merged_data = pd.merge(
+                    working_df,
+                    sentiment_metrics,
+                    left_on=date_col,
+                    right_on='date',
+                    how='left'
+                )
+            except ValueError as e:
+                logging.warning(f"Merge error: {e}")
+                logging.warning("Attempting alternative merge method using concat...")
+                
+                # Alternative approach using concat
+                sentiment_metrics = sentiment_metrics.set_index('date')
+                working_df_with_date_index = working_df.set_index(date_col)
+                
+                # Concat and then reset index
+                merged_data = pd.concat([working_df_with_date_index, sentiment_metrics], axis=1, join='left')
+                merged_data = merged_data.reset_index()
+                merged_data = merged_data.rename(columns={'index': date_col})
             
             # Fill missing sentiment values
             for col in merged_data.columns:
@@ -425,6 +497,10 @@ class Preprocessor:
             # Count news features for logging
             news_feature_count = sum(1 for col in merged_data.columns if isinstance(col, str) and col.startswith('news_'))
             logging.info(f"Added {news_feature_count} news sentiment features")
+            
+            # List the specific sentiment features added
+            sentiment_features = [col for col in merged_data.columns if isinstance(col, str) and col.startswith('news_')]
+            logging.info(f"Sentiment features added: {sentiment_features}")
             
             return merged_data
             
@@ -507,10 +583,28 @@ class Preprocessor:
         close_prices = df['Close'].values.reshape(-1, 1)
         self.price_scaler.fit(close_prices)
         
-        # Scale the features
+        # Separate sentiment features for specialized scaling
         feature_columns = df.columns.tolist()
-        self.feature_scaler.fit(df)
-        df_scaled = pd.DataFrame(self.feature_scaler.transform(df), columns=feature_columns)
+        sentiment_cols = [col for col in feature_columns if isinstance(col, str) and col.startswith('news_')]
+        non_sentiment_cols = [col for col in feature_columns if col not in sentiment_cols]
+        
+        # Create a copy of the DataFrame to avoid modifying the original
+        df_scaled = df.copy()
+        
+        # Scale non-sentiment features
+        if non_sentiment_cols:
+            non_sentiment_data = df[non_sentiment_cols].values
+            self.feature_scaler.fit(non_sentiment_data)
+            df_scaled[non_sentiment_cols] = self.feature_scaler.transform(non_sentiment_data)
+        
+        # Scale sentiment features separately if they exist
+        if sentiment_cols:
+            sentiment_data = df[sentiment_cols].fillna(0).values
+            self.sentiment_scaler.fit(sentiment_data)
+            df_scaled[sentiment_cols] = self.sentiment_scaler.transform(sentiment_data)
+            
+            # Save the sentiment feature names for later use
+            np.save(os.path.join(self.processed_dir, "sentiment_columns.npy"), sentiment_cols)
         
         # Create sequences with sliding window
         X, y = self.create_sliding_windows(df_scaled)

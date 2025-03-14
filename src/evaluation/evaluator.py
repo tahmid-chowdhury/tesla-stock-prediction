@@ -298,3 +298,151 @@ class ModelEvaluator:
             'recall': recall,
             'f1': f1
         }
+    
+    def _plot_predictions(self, y_true, y_pred):
+        """
+        Plot true vs predicted values and save the figure
+        
+        Args:
+            y_true: True values
+            y_pred: Predicted values
+        """
+        plt.figure(figsize=(10, 6))
+        
+        # Plot actual vs predicted
+        plt.plot(y_true, label='True Values', color='blue', alpha=0.7)
+        plt.plot(y_pred, label='Predictions', color='red', alpha=0.7)
+        
+        plt.title('Stock Price Prediction: True vs Predicted')
+        plt.xlabel('Time')
+        plt.ylabel('Price')
+        plt.legend()
+        plt.grid(True)
+        
+        # Save the figure
+        filename = os.path.join(self.results_dir, f'prediction_vs_true_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png')
+        plt.savefig(filename)
+        plt.close()
+        
+        # Create scatterplot to show correlation
+        plt.figure(figsize=(8, 8))
+        plt.scatter(y_true, y_pred, alpha=0.5)
+        plt.plot([min(y_true), max(y_true)], [min(y_true), max(y_true)], 'r--')  # Add y=x line
+        
+        plt.title('Scatter Plot: True vs Predicted')
+        plt.xlabel('True Values')
+        plt.ylabel('Predicted Values')
+        plt.grid(True)
+        
+        # Save the figure
+        filename = os.path.join(self.results_dir, f'prediction_scatter_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png')
+        plt.savefig(filename)
+        plt.close()
+        
+    def _plot_horizon_errors(self, horizon_metrics):
+        """
+        Plot prediction errors over the forecasting horizon
+        
+        Args:
+            horizon_metrics: Dictionary containing error metrics for each day in the horizon
+        """
+        if not horizon_metrics:
+            return
+        
+        horizons = sorted(horizon_metrics.keys())
+        days = [int(h.split('_')[1]) for h in horizons]
+        
+        rmse_values = [horizon_metrics[h]['rmse'] for h in horizons]
+        mape_values = [horizon_metrics[h]['mape'] for h in horizons]
+        
+        plt.figure(figsize=(12, 6))
+        
+        # Plot RMSE by day
+        plt.subplot(1, 2, 1)
+        plt.plot(days, rmse_values, 'o-', color='blue')
+        plt.title('RMSE by Forecast Horizon')
+        plt.xlabel('Days Ahead')
+        plt.ylabel('RMSE')
+        plt.grid(True)
+        
+        # Plot MAPE by day
+        plt.subplot(1, 2, 2)
+        plt.plot(days, mape_values, 'o-', color='red')
+        plt.title('MAPE by Forecast Horizon')
+        plt.xlabel('Days Ahead')
+        plt.ylabel('MAPE (%)')
+        plt.grid(True)
+        
+        plt.tight_layout()
+        
+        # Save the figure
+        filename = os.path.join(self.results_dir, f'horizon_errors_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png')
+        plt.savefig(filename)
+        plt.close()
+    
+    def _plot_trading_results(self, transactions_df):
+        """
+        Create visualizations of trading results
+        
+        Args:
+            transactions_df: DataFrame containing transaction data
+        """
+        if transactions_df.empty:
+            return
+            
+        # Plot portfolio value over time
+        plt.figure(figsize=(12, 8))
+        
+        # Add portfolio value
+        plt.subplot(2, 1, 1)
+        plt.plot(transactions_df.index, transactions_df['portfolio_value'], 'b-')
+        plt.title('Portfolio Value Over Time')
+        plt.xlabel('Trade')
+        plt.ylabel('Portfolio Value')
+        plt.grid(True)
+        
+        # Plot buy/sell points with profit coloring
+        plt.subplot(2, 1, 2)
+        plt.plot(transactions_df.index, transactions_df['price'], 'k-', alpha=0.5)
+        
+        # Mark buy points
+        buys = transactions_df[transactions_df['action'] == 'BUY']
+        plt.scatter(buys.index, buys['price'], color='green', marker='^', s=100, label='Buy')
+        
+        # Mark sell points colored by profit/loss
+        sells = transactions_df[transactions_df['action'] == 'SELL']
+        
+        # Profitable sells (green)
+        profitable_sells = sells[sells['profit'] > 0]
+        plt.scatter(profitable_sells.index, profitable_sells['price'], color='darkgreen', marker='v', s=100, label='Sell (Profit)')
+        
+        # Unprofitable sells (red)
+        unprofitable_sells = sells[sells['profit'] <= 0]
+        plt.scatter(unprofitable_sells.index, unprofitable_sells['price'], color='red', marker='v', s=100, label='Sell (Loss)')
+        
+        plt.title('Trading Actions')
+        plt.xlabel('Trade')
+        plt.ylabel('Price')
+        plt.legend()
+        plt.grid(True)
+        
+        plt.tight_layout()
+        
+        # Save the figure
+        filename = os.path.join(self.results_dir, f'trading_results_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png')
+        plt.savefig(filename)
+        plt.close()
+        
+        # Create profit/loss distribution chart
+        plt.figure(figsize=(10, 6))
+        sns.histplot(transactions_df['profit'], kde=True, bins=20)
+        plt.axvline(x=0, color='r', linestyle='--')
+        plt.title('Profit/Loss Distribution')
+        plt.xlabel('Profit/Loss')
+        plt.ylabel('Frequency')
+        plt.grid(True)
+        
+        # Save the figure
+        filename = os.path.join(self.results_dir, f'profit_distribution_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png')
+        plt.savefig(filename)
+        plt.close()
