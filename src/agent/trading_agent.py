@@ -588,9 +588,9 @@ class TradingAgent:
             }
         }
     
-    def decide_action(self, current_price, predicted_price, available_capital, current_shares, price_history=None):
+    def decide_action(self, current_price, predicted_price, available_capital, current_shares, price_history=None, sentiment_data=None):
         """
-        Decide trading action based on prediction and stop-loss criteria
+        Decide trading action based on prediction, stop-loss criteria, and sentiment
         
         Args:
             current_price: Current stock price
@@ -598,6 +598,7 @@ class TradingAgent:
             available_capital: Available cash
             current_shares: Current number of shares owned
             price_history: Recent price history for trend analysis
+            sentiment_data: Optional dictionary of sentiment features for current date
             
         Returns:
             action: 'buy', 'sell', or 'hold'
@@ -678,6 +679,22 @@ class TradingAgent:
         # Calculate price change percentage for prediction
         price_change = (predicted_price - current_price) / current_price * 100
         
+        # Adjust price change based on sentiment if available
+        sentiment_adjustment = 0
+        if sentiment_data is not None and hasattr(self, 'sentiment_influence'):
+            # Check for weighted sentiment or polarity mean
+            if 'news_weighted_sentiment' in sentiment_data:
+                sentiment_value = sentiment_data['news_weighted_sentiment']
+                sentiment_adjustment = sentiment_value * self.sentiment_influence * 5  # Scale for percentage
+                logging.info(f"Sentiment adjustment: {sentiment_adjustment:.2f}% (value: {sentiment_value:.2f})")
+            elif 'news_polarity_mean' in sentiment_data:
+                sentiment_value = sentiment_data['news_polarity_mean']
+                sentiment_adjustment = sentiment_value * self.sentiment_influence * 5
+                logging.info(f"Sentiment adjustment using polarity mean: {sentiment_adjustment:.2f}%")
+                
+        # Apply sentiment adjustment
+        adjusted_price_change = price_change + sentiment_adjustment
+        
         # Get adaptive thresholds based on current market conditions
         thresholds = self.calculate_adaptive_thresholds(price_history, current_price, predicted_price)
         buy_threshold = thresholds['buy_threshold']
@@ -704,7 +721,7 @@ class TradingAgent:
         if self.consecutive_losses > 0:
             max_position = max_position * (1 - min(self.consecutive_losses * 0.1, 0.5))
         
-        if price_change > buy_threshold and available_capital > current_price:
+        if adjusted_price_change > buy_threshold and available_capital > current_price:
             # Buy logic
             # Strengthen or weaken conviction based on technical signals
             if tech_signals['signal'] == 'buy':
@@ -718,7 +735,7 @@ class TradingAgent:
             if self._increment_trade_count():
                 # Buy signal
                 # Calculate the position size based on conviction and adjusted for risk
-                conviction = min(price_change / buy_threshold, 1.5) * conviction_modifier
+                conviction = min(adjusted_price_change / buy_threshold, 1.5) * conviction_modifier
                 position_size = available_capital * max_position * conviction
                 
                 # Ensure we don't spend more than available
@@ -734,7 +751,7 @@ class TradingAgent:
                     self.purchase_price = total_value / (current_shares + quantity)
                 
                 return 'buy', quantity
-        elif price_change < sell_threshold and current_shares > 0:
+        elif adjusted_price_change < sell_threshold and current_shares > 0:
             # Sell logic
             # Strengthen or weaken conviction based on technical signals
             if tech_signals['signal'] == 'sell':
@@ -748,7 +765,7 @@ class TradingAgent:
             if self._increment_trade_count():
                 # Sell signal
                 # Stronger conviction = sell more shares
-                conviction = min(abs(price_change / sell_threshold), 1.5) * conviction_modifier
+                conviction = min(abs(adjusted_price_change / sell_threshold), 1.5) * conviction_modifier
                 quantity = max(1, min(current_shares, int(current_shares * conviction)))
                 
                 return 'sell', quantity
@@ -835,7 +852,7 @@ class TradingAgent:
             else:
                 self.consecutive_losses = 0
     
-    def run_simulation(self, test_data, test_dates, feature_scaler, final_trade=True):
+    def run_simulation(self, test_data, test_dates, feature_scaler, sentiment_data=None, final_trade=True):
         """
         Run a trading simulation using test data
         
@@ -843,6 +860,7 @@ class TradingAgent:
             test_data: Processed test data for prediction
             test_dates: Dates corresponding to the test data
             feature_scaler: Scaler for feature transformation
+            sentiment_data: Optional DataFrame containing sentiment features indexed by date
             final_trade: Whether to liquidate all shares at the end
             
         Returns:
@@ -897,13 +915,25 @@ class TradingAgent:
                 'predicted_5_day': predicted_prices[-1] if len(predicted_prices) >= 5 else predicted_prices[-1],
             })
             
-            # Decide action with all required parameters
+            # Get sentiment data for current date if available
+            current_sentiment = None
+            if sentiment_data is not None:
+                try:
+                    # Try to get sentiment for the current date
+                    if current_date in sentiment_data.index:
+                        current_sentiment = sentiment_data.loc[current_date].to_dict()
+                        logging.debug(f"Found sentiment data for {current_date}")
+                except Exception as e:
+                    logging.warning(f"Error retrieving sentiment for date {current_date}: {e}")
+            
+            # Decide action with all required parameters and sentiment data
             action, amount = self.decide_action(
                 current_price=current_price,
                 predicted_price=predicted_prices[0],
                 available_capital=self.current_capital,
                 current_shares=self.shares_owned,
-                price_history=price_history
+                price_history=price_history,
+                sentiment_data=current_sentiment
             )
             
             # Execute trade using the NEXT day's price (simulating real trading)
