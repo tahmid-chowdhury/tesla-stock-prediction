@@ -588,13 +588,13 @@ class TradingAgent:
             }
         }
     
-    def decide_action(self, current_price, predicted_price, available_capital, current_shares, price_history=None, sentiment_data=None):
+    def decide_action(self, current_price, predicted_prices, available_capital, current_shares, price_history=None, sentiment_data=None):
         """
         Decide trading action based on prediction, stop-loss criteria, and sentiment
         
         Args:
             current_price: Current stock price
-            predicted_price: Predicted stock price
+            predicted_prices: Array of predicted prices for next 5 days (not just next day)
             available_capital: Available cash
             current_shares: Current number of shares owned
             price_history: Recent price history for trend analysis
@@ -675,104 +675,166 @@ class TradingAgent:
         # Analyze technical indicators
         tech_signals = self.analyze_technical_indicators(price_history)
         
-        # Standard trading logic if stop-loss not triggered
-        # Calculate price change percentage for prediction
-        price_change = (predicted_price - current_price) / current_price * 100
-        
-        # Adjust price change based on sentiment if available
-        sentiment_adjustment = 0
-        if sentiment_data is not None and hasattr(self, 'sentiment_influence'):
-            # Check for weighted sentiment or polarity mean
-            if 'news_weighted_sentiment' in sentiment_data:
-                sentiment_value = sentiment_data['news_weighted_sentiment']
-                sentiment_adjustment = sentiment_value * self.sentiment_influence * 5  # Scale for percentage
-                logging.info(f"Sentiment adjustment: {sentiment_adjustment:.2f}% (value: {sentiment_value:.2f})")
-            elif 'news_polarity_mean' in sentiment_data:
-                sentiment_value = sentiment_data['news_polarity_mean']
-                sentiment_adjustment = sentiment_value * self.sentiment_influence * 5
-                logging.info(f"Sentiment adjustment using polarity mean: {sentiment_adjustment:.2f}%")
-                
-        # Apply sentiment adjustment
-        adjusted_price_change = price_change + sentiment_adjustment
-        
-        # Get adaptive thresholds based on current market conditions
-        thresholds = self.calculate_adaptive_thresholds(price_history, current_price, predicted_price)
-        buy_threshold = thresholds['buy_threshold']
-        sell_threshold = thresholds['sell_threshold']
-        
-        # Adjust thresholds based on technical signals
-        if tech_signals['signal'] == 'buy':
-            # Lower buy threshold, raise sell threshold
-            adjustment_factor = 1 - (0.3 * tech_signals['strength'])
-            buy_threshold *= adjustment_factor
-            sell_threshold *= adjustment_factor
-            logging.info(f"Technical buy signal detected. Adjusted thresholds: Buy={buy_threshold:.2f}, Sell={sell_threshold:.2f}")
-        elif tech_signals['signal'] == 'sell':
-            # Raise buy threshold, lower sell threshold
-            adjustment_factor = 1 + (0.3 * tech_signals['strength'])
-            buy_threshold *= adjustment_factor
-            sell_threshold *= adjustment_factor
-            logging.info(f"Technical sell signal detected. Adjusted thresholds: Buy={buy_threshold:.2f}, Sell={sell_threshold:.2f}")
-        
-        # Risk-adjusted position sizing
-        max_position = min(0.5, self.risk_factor)
-        
-        # If we've had consecutive losses, reduce position size
-        if self.consecutive_losses > 0:
-            max_position = max_position * (1 - min(self.consecutive_losses * 0.1, 0.5))
-        
-        if adjusted_price_change > buy_threshold and available_capital > current_price:
-            # Buy logic
-            # Strengthen or weaken conviction based on technical signals
-            if tech_signals['signal'] == 'buy':
-                conviction_modifier = 1 + (0.5 * tech_signals['strength'])
-            elif tech_signals['signal'] == 'sell':
-                conviction_modifier = 1 - (0.5 * tech_signals['strength'])
-            else:
-                conviction_modifier = 1.0
+        # NEW APPROACH: Analyze the full 5-day prediction window
+        if isinstance(predicted_prices, np.ndarray) and predicted_prices.size >= self.prediction_horizon:
+            # Get the entire prediction horizon (usually 5 days)
+            prediction_window = predicted_prices[:self.prediction_horizon]
             
-            # Check trade count limit
-            if self._increment_trade_count():
-                # Buy signal
-                # Calculate the position size based on conviction and adjusted for risk
-                conviction = min(adjusted_price_change / buy_threshold, 1.5) * conviction_modifier
-                position_size = available_capital * max_position * conviction
-                
-                # Ensure we don't spend more than available
-                max_shares = int(position_size / (current_price * (1 + self.transaction_fee)))
-                quantity = max(1, min(max_shares, int(available_capital / (current_price * (1 + self.transaction_fee)))))
-                
-                # Update purchase price for stop-loss calculation
-                if current_shares == 0:  # First purchase
-                    self.purchase_price = current_price
-                    self.highest_price_since_purchase = current_price
-                else:  # Additional purchase - calculate average price
-                    total_value = (self.purchase_price * current_shares) + (current_price * quantity)
-                    self.purchase_price = total_value / (current_shares + quantity)
-                
-                return 'buy', quantity
-        elif adjusted_price_change < sell_threshold and current_shares > 0:
-            # Sell logic
-            # Strengthen or weaken conviction based on technical signals
-            if tech_signals['signal'] == 'sell':
-                conviction_modifier = 1 + (0.5 * tech_signals['strength'])
-            elif tech_signals['signal'] == 'buy':
-                conviction_modifier = 1 - (0.5 * tech_signals['strength'])
-            else:
-                conviction_modifier = 1.0
+            # Find the best day to buy (lowest price in window)
+            min_price_day = np.argmin(prediction_window)
+            min_price = prediction_window[min_price_day]
             
-            # Check trade count limit
-            if self._increment_trade_count():
-                # Sell signal
-                # Stronger conviction = sell more shares
-                conviction = min(abs(adjusted_price_change / sell_threshold), 1.5) * conviction_modifier
-                quantity = max(1, min(current_shares, int(current_shares * conviction)))
+            # Find the best day to sell (highest price in window)
+            max_price_day = np.argmax(prediction_window)
+            max_price = prediction_window[max_price_day]
+            
+            # Calculate potential price changes
+            min_to_max_change = (max_price - min_price) / min_price * 100
+            current_to_min_change = (min_price - current_price) / current_price * 100
+            current_to_max_change = (max_price - current_price) / current_price * 100
+            
+            # Apply sentiment adjustment
+            sentiment_adjustment = 0
+            if sentiment_data is not None and hasattr(self, 'sentiment_influence'):
+                if 'news_weighted_sentiment' in sentiment_data:
+                    sentiment_value = sentiment_data['news_weighted_sentiment']
+                    sentiment_adjustment = sentiment_value * self.sentiment_influence * 5  # Scale for percentage
+                    logging.info(f"Sentiment adjustment: {sentiment_adjustment:.2f}% (value: {sentiment_value:.2f})")
+                elif 'news_polarity_mean' in sentiment_data:
+                    sentiment_value = sentiment_data['news_polarity_mean']
+                    sentiment_adjustment = sentiment_value * self.sentiment_influence * 5
+                    logging.info(f"Sentiment adjustment using polarity mean: {sentiment_adjustment:.2f}%")
                 
-                return 'sell', quantity
-        
-        # Hold by default
-        return 'hold', 0
-    
+                # Apply sentiment adjustment to our price changes
+                min_to_max_change += sentiment_adjustment
+                current_to_min_change += sentiment_adjustment
+                current_to_max_change += sentiment_adjustment
+            
+            # Get adaptive thresholds based on current market conditions
+            thresholds = self.calculate_adaptive_thresholds(price_history, current_price, predicted_prices[0])
+            buy_threshold = thresholds['buy_threshold']
+            sell_threshold = thresholds['sell_threshold']
+            
+            # Log the analysis
+            logging.info(f"5-day window analysis: Min price on day {min_price_day+1}: ${min_price:.2f}, " +
+                        f"Max price on day {max_price_day+1}: ${max_price:.2f}")
+            logging.info(f"Min-to-Max change: {min_to_max_change:.2f}%, Current-to-Min: {current_to_min_change:.2f}%, " +
+                        f"Current-to-Max: {current_to_max_change:.2f}%")
+            
+            # DECISION MAKING LOGIC BASED ON WINDOW ANALYSIS
+            
+            # If we don't own shares and we should buy
+            if current_shares == 0:
+                # Buy condition: Either price will drop first and then rise significantly,
+                # or price will rise immediately and significantly
+                
+                # Case 1: Min price occurs before max price (ideal buy-then-sell scenario)
+                if min_price_day < max_price_day and min_to_max_change > buy_threshold:
+                    # If min price is day 0 or 1, buy now
+                    if min_price_day <= 1 and self._increment_trade_count():
+                        # Calculate position based on conviction and risk
+                        max_position = min(0.5, self.risk_factor)
+                        conviction = min(min_to_max_change / buy_threshold, 1.5)
+                        position_size = available_capital * max_position * conviction
+                        quantity = max(1, min(
+                            int(position_size / (current_price * (1 + self.transaction_fee))),
+                            int(available_capital / (current_price * (1 + self.transaction_fee)))
+                        ))
+                        
+                        # Update purchase price for stop-loss
+                        self.purchase_price = current_price
+                        self.highest_price_since_purchase = current_price
+                        
+                        logging.info(f"BUY decision: Expected {min_to_max_change:.2f}% gain from day {min_price_day+1} to {max_price_day+1}")
+                        return 'buy', quantity
+                        
+                    # Otherwise, hold and wait for the minimum price day
+                    else:
+                        logging.info(f"HOLD decision: Waiting for minimum price on day {min_price_day+1}")
+                        return 'hold', 0
+                
+                # Case 2: Current price is a good entry for immediate uptrend
+                elif current_to_max_change > buy_threshold:
+                    if self._increment_trade_count():
+                        max_position = min(0.5, self.risk_factor)
+                        conviction = min(current_to_max_change / buy_threshold, 1.5)
+                        position_size = available_capital * max_position * conviction
+                        quantity = max(1, min(
+                            int(position_size / (current_price * (1 + self.transaction_fee))),
+                            int(available_capital / (current_price * (1 + self.transaction_fee)))
+                        ))
+                        
+                        self.purchase_price = current_price
+                        self.highest_price_since_purchase = current_price
+                        
+                        logging.info(f"BUY decision: Expected {current_to_max_change:.2f}% immediate gain to day {max_price_day+1}")
+                        return 'buy', quantity
+            
+            # If we own shares and should consider selling
+            elif current_shares > 0:
+                # Case 1: Price will immediately start dropping
+                if current_to_min_change < sell_threshold:
+                    if self._increment_trade_count():
+                        conviction = min(abs(current_to_min_change / sell_threshold), 1.5)
+                        quantity = max(1, min(current_shares, int(current_shares * conviction)))
+                        
+                        logging.info(f"SELL decision: Expected {current_to_min_change:.2f}% immediate drop")
+                        return 'sell', quantity
+                
+                # Case 2: Price will rise to a peak and then fall
+                elif max_price_day < min_price_day and max_price_day <= 2:
+                    # If max is today or tomorrow, consider selling
+                    if self._increment_trade_count():
+                        conviction = min(max(0.7, max_price_day / 2), 1.0)  # Higher conviction for earlier peak
+                        quantity = max(1, min(current_shares, int(current_shares * conviction)))
+                        
+                        logging.info(f"SELL decision: Expected price peak on day {max_price_day+1} followed by decline")
+                        return 'sell', quantity
+            
+            # Default: hold position
+            logging.info("HOLD decision: No clear buy/sell signal in prediction window")
+            return 'hold', 0
+            
+        # Fallback to old strategy if we don't have full prediction window
+        else:
+            # Calculate price change for next day only (old approach)
+            price_change = (predicted_prices[0] - current_price) / current_price * 100
+            
+            # Apply sentiment adjustment
+            sentiment_adjustment = 0
+            if sentiment_data is not None and hasattr(self, 'sentiment_influence'):
+                # Complete the if block with sentiment adjustment code
+                if 'news_weighted_sentiment' in sentiment_data:
+                    sentiment_value = sentiment_data['news_weighted_sentiment']
+                    sentiment_adjustment = sentiment_value * self.sentiment_influence * 5  # Scale for percentage
+                    logging.info(f"Sentiment adjustment (fallback): {sentiment_adjustment:.2f}% (value: {sentiment_value:.2f})")
+                elif 'news_polarity_mean' in sentiment_data:
+                    sentiment_value = sentiment_data['news_polarity_mean']
+                    sentiment_adjustment = sentiment_value * self.sentiment_influence * 5
+                    logging.info(f"Sentiment adjustment using polarity mean (fallback): {sentiment_adjustment:.2f}%")
+                
+            # Apply sentiment adjustment
+            adjusted_price_change = price_change + sentiment_adjustment
+            
+            # Get adaptive thresholds
+            thresholds = self.calculate_adaptive_thresholds(price_history, current_price, predicted_prices[0])
+            buy_threshold = thresholds['buy_threshold']
+            sell_threshold = thresholds['sell_threshold']
+            
+            # Simple decision logic as fallback
+            if current_shares == 0 and adjusted_price_change > buy_threshold:
+                if self._increment_trade_count():
+                    max_position = min(0.5, self.risk_factor)
+                    quantity = max(1, int(available_capital * max_position / (current_price * (1 + self.transaction_fee))))
+                    return 'buy', quantity
+            elif current_shares > 0 and adjusted_price_change < sell_threshold:
+                if self._increment_trade_count():
+                    return 'sell', current_shares
+            
+            # For simplicity, just hold if we're in the fallback case
+            logging.info("HOLD decision (fallback): Using simplified fallback logic")
+            return 'hold', 0
+
     def execute_trade(self, action, amount, current_price, timestamp):
         """
         Execute a trade based on the decided action
@@ -876,7 +938,6 @@ class TradingAgent:
         window_size = test_data.shape[1]
         
         # Calculate how many iterations we can safely do
-        # We need to make sure i + window_size is less than the length of test_dates
         max_iterations = min(len(test_data) - 1, len(test_dates) - window_size)
         
         for i in range(max_iterations):
@@ -913,6 +974,7 @@ class TradingAgent:
                 'actual_price': current_price,
                 'predicted_next_day': predicted_prices[0],
                 'predicted_5_day': predicted_prices[-1] if len(predicted_prices) >= 5 else predicted_prices[-1],
+                'all_predictions': predicted_prices.tolist()  # Store all predictions
             })
             
             # Get sentiment data for current date if available
@@ -926,10 +988,10 @@ class TradingAgent:
                 except Exception as e:
                     logging.warning(f"Error retrieving sentiment for date {current_date}: {e}")
             
-            # Decide action with all required parameters and sentiment data
+            # Decide action with all required parameters including full prediction window
             action, amount = self.decide_action(
                 current_price=current_price,
-                predicted_price=predicted_prices[0],
+                predicted_prices=predicted_prices,  # Pass all predicted prices, not just next day
                 available_capital=self.current_capital,
                 current_shares=self.shares_owned,
                 price_history=price_history,
