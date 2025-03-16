@@ -186,8 +186,50 @@ class HyperparameterTuner:
                 for param, value in best_hps.values.items():
                     f.write(f"{param}: {value}\n")
             
+            # Clean up old tuner files to save disk space
+            self._clean_up_tuner_files(timestamp)
+            
             return best_model, history, best_hps
             
         except Exception as e:
             logging.error(f"Error during hyperparameter tuning: {e}")
             return None, None, None
+    
+    def _clean_up_tuner_files(self, current_timestamp):
+        """
+        Delete old tuner directories and files to save disk space
+        
+        Args:
+            current_timestamp: Current timestamp to identify files to keep
+        """
+        try:
+            # Keep only the current tuning session and delete old ones
+            deleted_dirs = 0
+            
+            # Get all directories in tuner_dir
+            for item in os.listdir(self.tuner_dir):
+                item_path = os.path.join(self.tuner_dir, item)
+                
+                # Skip current session files
+                if current_timestamp in item:
+                    continue
+                    
+                # Skip non-directories and important files
+                if not os.path.isdir(item_path) and not item.endswith('.txt'):
+                    continue
+                
+                # Delete old tuning directories
+                try:
+                    if os.path.isdir(item_path):
+                        import shutil
+                        shutil.rmtree(item_path)
+                    else:
+                        os.remove(item_path)
+                    deleted_dirs += 1
+                except Exception as e:
+                    logging.warning(f"Could not delete old tuner file {item_path}: {e}")
+            
+            if deleted_dirs > 0:
+                logging.info(f"Cleaned up {deleted_dirs} old tuner files/directories to save storage space")
+        except Exception as e:
+            logging.warning(f"Error while cleaning up tuner files: {e}")

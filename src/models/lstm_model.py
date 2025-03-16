@@ -92,6 +92,12 @@ class LSTMModel:
         if self.model is None:
             self.build_model(lstm_units, dropout_rate, learning_rate)
             
+        # Generate unique timestamp for this training session
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Create checkpoint path with timestamp to avoid conflicts
+        checkpoint_path = os.path.join(self.models_dir, f'lstm_checkpoint_{timestamp}.keras')
+        
         # Create callbacks for better training
         callbacks = [
             # Early stopping to prevent overfitting
@@ -103,9 +109,9 @@ class LSTMModel:
                 verbose=1
             ),
             
-            # Model checkpoint to save best model
+            # Model checkpoint to save best model during training
             ModelCheckpoint(
-                filepath=os.path.join(self.models_dir, f'lstm_best_checkpoint_{datetime.now().strftime("%Y%m%d_%H%M%S")}.keras'),
+                filepath=checkpoint_path,
                 monitor='val_loss' if X_val is not None else 'loss',
                 save_best_only=True,
                 mode='min',
@@ -144,21 +150,77 @@ class LSTMModel:
                 verbose=2
             )
         
-        # Save the final model
-        model_filename = os.path.join(self.models_dir, f'lstm_{datetime.now().strftime("%Y%m%d_%H%M%S")}.keras')
-        self.model.save(model_filename)
-        logging.info(f"Model saved to {model_filename}")
+        # Save the final model with timestamp
+        final_model_path = os.path.join(self.models_dir, f'lstm_tuned_{timestamp}.keras')
+        self.model.save(final_model_path)
+        logging.info(f"Final model saved to {final_model_path}")
         
-        # Permanently save best model for easy loading
+        # Save as best model (overwriting previous best) for easy loading
         best_model_path = os.path.join(self.models_dir, 'lstm_best.keras')
         self.model.save(best_model_path)
         logging.info(f"Best model saved to {best_model_path}")
+        
+        # Clean up old model files to save storage space
+        self._clean_up_model_files(final_model_path, best_model_path)
         
         # Plot and save training curves
         if hasattr(history, 'history'):
             self._plot_training_curves(history.history)
             
         return history
+
+    def _clean_up_model_files(self, current_model_path, best_model_path):
+        """
+        Delete old model files to save disk space
+        
+        Args:
+            current_model_path: Path to the current model file (to keep)
+            best_model_path: Path to the best model file (to keep)
+        """
+        try:
+            # Get all .keras files in the models directory
+            keras_files = [os.path.join(self.models_dir, f) for f in os.listdir(self.models_dir) 
+                          if f.endswith('.keras')]
+            
+            # The files to keep
+            files_to_keep = [current_model_path, best_model_path]
+            
+            # Delete all old model files
+            deleted_count = 0
+            for file_path in keras_files:
+                if file_path not in files_to_keep and os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                        deleted_count += 1
+                    except Exception as e:
+                        logging.warning(f"Could not delete old model file {file_path}: {e}")
+            
+            # Clean up tuner directory if it exists
+            tuner_dir = os.path.join(os.path.dirname(self.models_dir), "models", "tuner")
+            if os.path.exists(tuner_dir):
+                # Get timestamp part from current model path
+                current_timestamp = os.path.basename(current_model_path).split('_')[1].split('.')[0]
+                
+                # Delete old tuner directories
+                tuner_deleted = 0
+                for item in os.listdir(tuner_dir):
+                    item_path = os.path.join(tuner_dir, item)
+                    
+                    # Only delete directories, and only if they're not from current session
+                    if os.path.isdir(item_path) and current_timestamp not in item:
+                        try:
+                            import shutil
+                            shutil.rmtree(item_path)
+                            tuner_deleted += 1
+                        except Exception as e:
+                            logging.warning(f"Could not delete tuner directory {item_path}: {e}")
+                
+                if tuner_deleted > 0:
+                    logging.info(f"Cleaned up {tuner_deleted} old tuner directories to save storage space")
+            
+            logging.info(f"Cleaned up {deleted_count} old model files to save storage space")
+        except Exception as e:
+            logging.warning(f"Error while cleaning up old files: {e}")
         
     def predict(self, X):
         """
