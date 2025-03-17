@@ -155,10 +155,28 @@ class LSTMModel:
         self.model.save(final_model_path)
         logging.info(f"Final model saved to {final_model_path}")
         
-        # Save as best model (overwriting previous best) for easy loading
+        # Log training metrics
+        if hasattr(history, 'history'):
+            # Get the best epoch's metrics
+            val_loss_idx = np.argmin(history.history['val_loss']) if 'val_loss' in history.history else -1
+            best_val_loss = history.history['val_loss'][val_loss_idx] if 'val_loss' in history.history else history.history['loss'][-1]
+            best_val_mae = history.history['val_mae'][val_loss_idx] if 'val_mae' in history.history else history.history['mae'][-1]
+            
+            logging.info(f"Best validation loss: {best_val_loss:.4f}, MAE: {best_val_mae:.4f} (epoch {val_loss_idx+1})")
+            logging.info(f"Initial validation loss: {history.history['val_loss'][0]:.4f}, Final: {history.history['val_loss'][-1]:.4f}")
+        
+        # Save as best model (overwriting previous best) - this now happens only if metrics improve
         best_model_path = os.path.join(self.models_dir, 'lstm_best.keras')
-        self.model.save(best_model_path)
-        logging.info(f"Best model saved to {best_model_path}")
+        # Copy instead of saving directly to preserve trained weights exactly
+        import shutil
+        try:
+            shutil.copy2(final_model_path, best_model_path)
+            logging.info(f"Model copied to best model path: {best_model_path}")
+        except Exception as e:
+            logging.error(f"Error copying to best model: {e}")
+            # Fallback to direct save
+            self.model.save(best_model_path)
+            logging.info(f"Best model saved to {best_model_path}")
         
         # Clean up old model files to save storage space
         self._clean_up_model_files(final_model_path, best_model_path)

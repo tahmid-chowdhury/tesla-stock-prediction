@@ -148,12 +148,27 @@ class HyperparameterTuner:
         
         # Search for best hyperparameters
         try:
+            logging.info(f"Starting hyperparameter search with {self.max_trials} trials")
+            # Track the best val_loss from previous trials to show improvement
+            best_val_loss = float('inf')
+            
+            class PrintResultCallback(kt.callbacks.Callback):
+                def on_trial_end(callback_self, trial, logs=None):
+                    if logs:
+                        val_loss = logs.get('val_loss', float('inf'))
+                        if val_loss < best_val_loss:
+                            improvement = "✓ IMPROVED"
+                        else:
+                            improvement = "✗ no improvement"
+                        
+                        logging.info(f"Trial {trial.trial_id} completed - val_loss: {val_loss:.4f} ({improvement})")
+            
             tuner.search(
                 X_train, y_train,
                 validation_data=(X_val, y_val),
                 epochs=epochs,
                 batch_size=batch_size,
-                callbacks=[stop_early]
+                callbacks=[stop_early, PrintResultCallback()]
             )
             
             # Get the best hyperparameters

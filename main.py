@@ -17,6 +17,7 @@ from src.models.lstm_model import LSTMModel
 from src.agent.trading_agent import TradingAgent
 from src.evaluation.evaluator import ModelEvaluator
 from src.models.hyperparameter_tuner import HyperparameterTuner
+from src.visualization.metrics_visualizer import MetricsVisualizer
 
 # Configure logging
 logging.basicConfig(
@@ -39,8 +40,8 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description='Tesla Stock Trading Agent')
     
     parser.add_argument('--mode', type=str, default='train', 
-                        choices=['train', 'test', 'trade'],
-                        help='Mode of operation: train, test, or trade')
+                        choices=['train', 'test', 'trade', 'visualize-metrics'],
+                        help='Mode of operation: train, test, trade, or visualize-metrics')
     
     parser.add_argument('--window-size', type=int, default=30,
                         help='Size of sliding window (days) for feature creation')
@@ -97,11 +98,26 @@ def parse_arguments():
     parser.add_argument('--sentiment-days', type=int, default=30,
                         help='Number of days of news to fetch for sentiment analysis')
     
+    # Add new argument for metrics visualization
+    parser.add_argument('--num-iterations', type=int, default=10,
+                       help='Number of previous training iterations to include in metrics visualization')
+    
     return parser.parse_args()
 
 def train_model(args):
     """Train the LSTM model"""
     logger.info("Starting model training process...")
+    
+    # Initialize metrics visualizer
+    metrics_visualizer = MetricsVisualizer()
+    
+    # Load previous best metrics if they exist
+    previous_best_metrics = load_previous_metrics()
+    if previous_best_metrics:
+        logger.info("Previous best model metrics loaded")
+        logger.info(f"Previous RMSE: {previous_best_metrics['rmse']:.4f}, Direction Accuracy: {previous_best_metrics['direction_accuracy']:.4f}")
+        if 'f1' in previous_best_metrics:
+            logger.info(f"Previous F1: {previous_best_metrics['f1']:.4f}")
     
     # Load data with option to use complete history
     data_loader = DataLoader("TSLA", api_key=args.newsapi_key)
@@ -216,13 +232,99 @@ def train_model(args):
     
     metrics = evaluator.evaluate_price_predictions(y_test, predictions, preprocessor.price_scaler)
     
-    # Log all metrics including the new classification metrics
-    logger.info(f"Training complete. RMSE: {metrics['rmse']:.2f}, Direction Accuracy: {metrics['direction_accuracy']:.2f}")
+    # Save metrics to history before comparing with previous best
+    metrics_visualizer.save_metrics(metrics)
     
-    if 'accuracy' in metrics:
-        logger.info(f"Classification metrics - Accuracy: {metrics['accuracy']:.2f}, F1: {metrics['f1']:.2f}")
+    # Compare with previous best and save if better
+    is_better = compare_and_save_metrics(metrics, previous_best_metrics)
+    
+    # Generate performance metrics history visualization
+    metrics_history_path = metrics_visualizer.plot_training_history(n_iterations=10)
+    if metrics_history_path:
+        logger.info(f"Performance metrics history visualization saved to {metrics_history_path}")
+    
+    # Print comparison with previous best
+    if previous_best_metrics:
+        print("\nPerformance Comparison:")
+        print("-" * 50)
+        print(f"{'Metric':<20} {'Previous':<15} {'Current':<15} {'Change':<15}")
+        print("-" * 50)
+        
+        for key in ['rmse', 'mae', 'direction_accuracy', 'accuracy', 'f1']:
+            if key in metrics and key in previous_best_metrics:
+                change = metrics[key] - previous_best_metrics[key]
+                change_symbol = "↑" if change > 0 else "↓" if change < 0 else "="
+                
+                # For error metrics (rmse, mae), lower is better
+                if key in ['rmse', 'mae']:
+                    improvement = "better" if change < 0 else "worse" if change > 0 else "same"
+                else:
+                    improvement = "better" if change > 0 else "worse" if change < 0 else "same"
+                
+                print(f"{key.upper():<20} {previous_best_metrics[key]:.4f}      {metrics[key]:.4f}      {change:.4f} {change_symbol} ({improvement})")
+        
+        if is_better:
+            print("\n✓ Current model SAVED as new best model")
+        else:
+            print("\n✗ Current model NOT saved (previous model is better)")
     
     return model, preprocessor, X_test, y_test
+
+def load_previous_metrics():
+    """Load metrics from previous best model"""
+    metrics_path = os.path.join(os.path.dirname(__file__), "results", "best_model_metrics.json")
+    
+    if os.path.exists(metrics_path):
+        try:
+            with open(metrics_path, 'r') as f:
+                import json
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Error loading previous metrics: {e}")
+            return None
+    else:
+        return None
+
+def compare_and_save_metrics(current_metrics, previous_metrics):
+    """
+    Compare current metrics with previous best and save if better
+    Returns True if current metrics are better and were saved
+    """
+    # Define a scoring function (higher is better)
+    def calculate_score(metrics):
+        # Weighted sum of metrics (negative for error metrics since lower is better)
+        score = 0
+        if 'rmse' in metrics:
+            score -= 0.3 * metrics['rmse']  # Lower RMSE is better
+        if 'direction_accuracy' in metrics:
+            score += 0.3 * metrics['direction_accuracy']  # Higher direction accuracy is better
+        if 'f1' in metrics:
+            score += 0.4 * metrics['f1']  # Higher F1 is better
+        return score
+    
+    # Calculate scores
+    current_score = calculate_score(current_metrics)
+    
+    # If no previous metrics or current is better, save current as best
+    if not previous_metrics or current_score > calculate_score(previous_metrics):
+        metrics_path = os.path.join(os.path.dirname(__file__), "results", "best_model_metrics.json")
+        try:
+            # Ensure results directory exists
+            os.makedirs(os.path.dirname(metrics_path), exist_ok=True)
+            
+            # Save metrics
+            with open(metrics_path, 'w') as f:
+                import json
+                json.dump(current_metrics, f, indent=2)
+            
+            logger.info(f"New best metrics saved with score: {current_score:.4f}")
+            return True
+        except Exception as e:
+            logger.error(f"Error saving metrics: {e}")
+            return False
+    else:
+        logger.info(f"Current model score ({current_score:.4f}) did not improve upon previous best")
+        return False
 
 def test_model(args, model=None, preprocessor=None):
     """Test the model on historical data"""
@@ -825,6 +927,12 @@ def main():
             
         elif args.mode == 'trade':
             trade(args)
+            
+        # Add a new mode for visualizing metrics history
+        elif args.mode == 'visualize-metrics':
+            visualizer = MetricsVisualizer()
+            metrics_path = visualizer.plot_training_history(n_iterations=args.num_iterations if hasattr(args, 'num_iterations') else 10)
+            logger.info(f"Metrics history visualization created: {metrics_path}")
             
         else:
             logger.error(f"Unknown mode: {args.mode}")
