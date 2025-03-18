@@ -26,12 +26,111 @@ class Preprocessor:
         self.data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data")
         self.raw_dir = os.path.join(self.data_dir, "raw")
         self.processed_dir = os.path.join(self.data_dir, "processed")
+        self.models_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "models")
         self.price_scaler = MinMaxScaler()
         self.feature_scaler = StandardScaler()
         self.sentiment_scaler = RobustScaler()  # Better for sentiment data with outliers
         
         # Create directories if they don't exist
         os.makedirs(self.processed_dir, exist_ok=True)
+    
+    def load_model_metadata(self):
+        """
+        Load metadata from saved models to ensure feature compatibility
+        
+        Returns:
+            Dictionary with model metadata including expected feature dimensions, or None if not found
+        """
+        try:
+            # Try to find the best model file first
+            best_model_path = os.path.join(self.models_dir, "lstm_best.keras")
+            if os.path.exists(best_model_path):
+                # Look for a corresponding metadata file
+                metadata_files = [f for f in os.listdir(self.models_dir) if f.startswith("lstm_metadata_") and f.endswith(".json")]
+                if metadata_files:
+                    # Use the most recent metadata file
+                    latest_metadata = max(metadata_files, key=lambda f: os.path.getmtime(os.path.join(self.models_dir, f)))
+                    metadata_path = os.path.join(self.models_dir, latest_metadata)
+                    
+                    with open(metadata_path, 'r') as f:
+                        metadata = json.load(f)
+                        logging.info(f"Loaded model metadata from {metadata_path}")
+                        return metadata
+                
+                # If we can't find metadata files, try to get feature info from other sources
+                feature_info_files = [f for f in os.listdir(self.models_dir) if f.startswith("features_") and f.endswith(".json")]
+                if feature_info_files:
+                    latest_feature_info = max(feature_info_files, key=lambda f: os.path.getmtime(os.path.join(self.models_dir, f)))
+                    feature_path = os.path.join(self.models_dir, latest_feature_info)
+                    
+                    with open(feature_path, 'r') as f:
+                        feature_info = json.load(f)
+                        logging.info(f"Loaded feature information from {feature_path}")
+                        return feature_info
+            
+            # If we still don't have metadata, try to load from saved model configuration
+            try:
+                import tensorflow as tf
+                if os.path.exists(best_model_path):
+                    model = tf.keras.models.load_model(best_model_path)
+                    feature_dim = model.input_shape[-1]
+                    metadata = {"feature_dim": feature_dim}
+                    logging.info(f"Extracted feature dimension {feature_dim} directly from model")
+                    return metadata
+            except Exception as e:
+                logging.warning(f"Could not load model to extract input shape: {e}")
+                
+            return None
+        except Exception as e:
+            logging.warning(f"Error loading model metadata: {e}")
+            return None
+    
+    def adjust_features_for_compatibility(self, df, feature_dim):
+        """
+        Adjust features to ensure compatibility with model's expected input dimension
+        
+        Args:
+            df: DataFrame with features
+            feature_dim: Expected feature dimension for the model
+        
+        Returns:
+            Adjusted DataFrame with compatible number of features
+        """
+        current_feature_count = len(df.columns)
+        
+        if current_feature_count == feature_dim:
+            return df  # No adjustment needed
+            
+        if current_feature_count > feature_dim:
+            logging.warning(f"Data has {current_feature_count} features but model expects {feature_dim}")
+            
+            # Get priority features to decide what to keep
+            priority_patterns = ['close', 'open', 'high', 'low', 'volume', 'sentiment']
+            priority_features = []
+            
+            for col in df.columns:
+                col_lower = str(col).lower()
+                if any(pattern in col_lower for pattern in priority_patterns):
+                    priority_features.append(col)
+            
+            # If we have enough priority features, use them
+            if len(priority_features) >= feature_dim:
+                logging.info(f"Using top {feature_dim} priority features")
+                return df[priority_features[:feature_dim]]
+            
+            # Otherwise, keep all priority features and add other columns until we reach feature_dim
+            other_features = [col for col in df.columns if col not in priority_features]
+            features_to_keep = priority_features + other_features[:feature_dim - len(priority_features)]
+            
+            logging.info(f"Keeping {len(priority_features)} priority features and {len(features_to_keep) - len(priority_features)} other features")
+            return df[features_to_keep]
+            
+        else:
+            # We have fewer features than expected - this is unusual but could happen
+            logging.error(f"Data has fewer features ({current_feature_count}) than model expects ({feature_dim})")
+            # One option would be to add dummy features, but that's likely to cause issues
+            # Instead, return as is and let calling code handle this case
+            return df
         
     def add_technical_indicators(self, df):
         """
@@ -608,6 +707,17 @@ class Preprocessor:
                 logging.info(f"Reorganized columns to prioritize core price data: {priority_columns}")
             else:
                 logging.warning("No standard price columns found for reorganization")
+
+        # Check for model metadata to ensure feature compatibility
+        model_metadata = self.load_model_metadata()
+        feature_dim = None
+        if model_metadata:
+            if 'feature_dim' in model_metadata:
+                feature_dim = model_metadata['feature_dim']
+                logging.info(f"Found model with {feature_dim} expected features")
+            elif 'feature_count' in model_metadata:
+                feature_dim = model_metadata['feature_count']
+                logging.info(f"Found model with {feature_dim} expected features")
         
         # Scale the closing prices for prediction
         close_prices = df['Close'].values.reshape(-1, 1)
@@ -636,6 +746,14 @@ class Preprocessor:
             # Save the sentiment feature names for later use
             np.save(os.path.join(self.processed_dir, "sentiment_columns.npy"), sentiment_cols)
         
+        # If feature_dim is available from model metadata, adjust features for compatibility
+        if feature_dim is not None and len(df_scaled.columns) != feature_dim:
+            df_original = df_scaled.copy()
+            df_scaled = self.adjust_features_for_compatibility(df_scaled, feature_dim)
+            logging.info(f"Adjusted features from {len(df_original.columns)} to {len(df_scaled.columns)} for model compatibility")
+            # Update feature_columns after adjustment
+            feature_columns = df_scaled.columns.tolist()
+        
         # Create sequences with sliding window
         X, y = self.create_sliding_windows(df_scaled)
         logging.info(f"Created sequences. X shape: {X.shape}, y shape: {y.shape}")
@@ -656,7 +774,7 @@ class Preprocessor:
         
         # Save feature names for future reference
         try:
-            feature_names = np.array(df.columns)
+            feature_names = np.array(df_scaled.columns)
             np.save(os.path.join(self.processed_dir, "feature_names.npy"), feature_names)
             logging.info(f"Saved {len(feature_names)} feature names for reference")
             
@@ -664,7 +782,7 @@ class Preprocessor:
             priority_features = []
             priority_patterns = ['close', 'open', 'high', 'low', 'volume']
             
-            for col in df.columns:
+            for col in df_scaled.columns:
                 col_lower = str(col).lower()
                 if any(pattern in col_lower for pattern in priority_patterns):
                     priority_features.append(col)
