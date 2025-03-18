@@ -1,0 +1,5 @@
+{
+  "timestamp": "20250317_225750",
+  "window_size": 30,
+  "prediction_horizon": 5
+}

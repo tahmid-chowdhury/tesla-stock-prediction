@@ -247,32 +247,31 @@ class HyperparameterTuner:
                 for param, value in best_hps.values.items():
                     f.write(f"{param}: {value}\n")
             
-            # Clean up old tuner files to save disk spacesion
+            # Clean up old tuner files to save disk space
             self._clean_up_tuner_files(timestamp)
+            
+            # Save model metadata to a JSON file
+            model_metadata = {
                 'timestamp': timestamp,
-            return best_model, history, best_hps
                 'window_size': self.window_size,
-        except Exception as e:rizon': self.prediction_horizon,
+                'prediction_horizon': self.prediction_horizon,
+            }
+            
+            with open(os.path.join(self.models_dir, f"lstm_metadata_{timestamp}.json"), 'w') as f:
+                import json
+                json.dump(model_metadata, f, indent=2)
+            
+            logging.info(f"Model metadata saved to {os.path.join(self.models_dir, f'lstm_metadata_{timestamp}.json')}")
+            
+            return best_model, history, best_hps
+            
+        except Exception as e:
             logging.error(f"Error during hyperparameter tuning: {e}")
             logging.error(traceback.format_exc())  # Print full traceback for better debugging
-            return None, None, Nonea JSON file
-            with open(os.path.join(self.models_dir, f"lstm_metadata_{timestamp}.json"), 'w') as f:
-    def _clean_up_tuner_files(self, current_timestamp):
-        """     json.dump(model_metadata, f, indent=2)
-        Delete old tuner directories and files to save disk spaceself.models_dir, f'lstm_metadata_{timestamp}.json')}")
+            return None, None, None
             
-        Args: Clean up old tuner files to save disk space
-            current_timestamp: Current timestamp to identify files to keep
-        """ 
-        try:return best_model, history, best_hps
-            # Keep only the current tuning session and delete old ones
-            deleted_dirs = 0e:
-            logging.error(f"Error during hyperparameter tuning: {e}")
-            # Get all directories in tuner_dir())  # Print full traceback for better debugging
-            for item in os.listdir(self.tuner_dir):
-                item_path = os.path.join(self.tuner_dir, item)
-                p_tuner_files(self, current_timestamp):
-                # Skip current session files
+    def _clean_up_tuner_files(self, current_timestamp):
+        """
         Delete old tuner directories and files to save disk space
         
         Args:
@@ -295,21 +294,22 @@ class HyperparameterTuner:
                     continue
                 
                 # Delete old tuning directories
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-            logging.warning(f"Error while cleaning up tuner files: {e}")        except Exception as e:                logging.info(f"Cleaned up {deleted_dirs} old tuner files/directories to save storage space")            if deleted_dirs > 0:                                logging.warning(f"Could not delete old tuner file {item_path}: {e}")                except Exception as e:                    deleted_dirs += 1                        os.remove(item_path)                    else:                        shutil.rmtree(item_path)                        import shutil                    if os.path.isdir(item_path):                try:
+                try:
+                    import shutil
+                    if os.path.isdir(item_path):
+                        shutil.rmtree(item_path)
+                    else:
+                        os.remove(item_path)
+                    deleted_dirs += 1
+                except Exception as e:
+                    logging.warning(f"Could not delete old tuner file {item_path}: {e}")
+            
+            if deleted_dirs > 0:
+                logging.info(f"Cleaned up {deleted_dirs} old tuner files/directories to save storage space")
+                
+        except Exception as e:
+            logging.warning(f"Error while cleaning up tuner files: {e}")
+    
     def save_feature_info(self, feature_names, file_suffix=None):
         """
         Save feature names used during training to ensure consistency between training and inference
@@ -319,68 +319,70 @@ class HyperparameterTuner:
             file_suffix: Optional suffix for the filename (default: current timestamp)
         """
         if file_suffix is None:
+            file_suffix = datetime.now().strftime('%Y%m%d_%H%M%S')
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-            return None            logging.error(f"Error loading feature information: {e}")        except Exception as e:            return None                                        return json.load(f)                    import json                with open(latest_file, 'r') as f:                latest_file = max(feature_files, key=os.path.getmtime)            if feature_files:            feature_files = glob.glob(os.path.join(self.models_dir, "features_*.json"))            import glob            # If no specific model path or files not found, look for the latest feature info file                                            return json.load(f)                                import json                            with open(metadata_file_path, 'r') as f:                        if os.path.exists(metadata_file_path):                        metadata_file_path = os.path.join(self.models_dir, f"lstm_metadata_{identifier}.json")                        # Try to find metadata file                    else:                            return json.load(f)                            import json                        with open(feature_file_path, 'r') as f:                    if os.path.exists(feature_file_path):                                        feature_file_path = os.path.join(self.models_dir, f"features_{identifier}.json")                    # Look for corresponding feature file                                        identifier = parts[-1].split('.')[0]  # Get the part before file extension                if len(parts) >= 2:                parts = basename.split('_')                basename = os.path.basename(model_path)                # Extract timestamp or identifier from model path            if model_path:        try:        """            Dictionary with feature information or None if not found        Returns:                        model_path: Path to the model file        Args:                Load feature information for a model        """    def load_feature_info(self, model_path=None):                return False            logging.error(f"Error saving feature information: {e}")
-        except Exception as e:            return True            logging.info(f"Feature information saved to {feature_file_path}")
-
+        feature_info = {
+            'feature_count': len(feature_names),
+            'feature_names': feature_names
+        }
+        
+        feature_file_path = os.path.join(self.models_dir, f"features_{file_suffix}.json")
+        
+        try:
+            with open(feature_file_path, 'w') as f:
+                import json
                 json.dump(feature_info, f, indent=2)
 
-
-                import json            with open(feature_file_path, 'w') as f:        try:        feature_file_path = os.path.join(self.models_dir, f"features_{file_suffix}.json")            file_suffix = datetime.now().strftime('%Y%m%d_%H%M%S')
-
-        # Save to JSON file
-
-
-
-
-                }            'feature_names': feature_names            'feature_count': len(feature_names),        feature_info = {            
+            logging.info(f"Feature information saved to {feature_file_path}")
+            return True
+            
+        except Exception as e:
+            logging.error(f"Error saving feature information: {e}")
+            return False
+            
+    def load_feature_info(self, model_path=None):
+        """
+        Load feature information for a model
+        
+        Args:
+            model_path: Path to the model file
+                        
+        Returns:
+            Dictionary with feature information or None if not found
+        """
+        try:
+            if model_path:
+                # Extract timestamp or identifier from model path
+                basename = os.path.basename(model_path)
+                parts = basename.split('_')
+                if len(parts) >= 2:
+                    identifier = parts[-1].split('.')[0]  # Get the part before file extension
+                    
+                    # Look for corresponding feature file
+                    feature_file_path = os.path.join(self.models_dir, f"features_{identifier}.json")
+                    if os.path.exists(feature_file_path):
+                        with open(feature_file_path, 'r') as f:
+                            import json
+                            return json.load(f)
+                            
+                    # Try to find metadata file
+                    metadata_file_path = os.path.join(self.models_dir, f"lstm_metadata_{identifier}.json")
+                    if os.path.exists(metadata_file_path):
+                        with open(metadata_file_path, 'r') as f:
+                            import json
+                            return json.load(f)
+            else:
+                # If no specific model path or files not found, look for the latest feature info file
+                import glob
+                feature_files = glob.glob(os.path.join(self.models_dir, "features_*.json"))
+                if feature_files:
+                    latest_file = max(feature_files, key=os.path.getmtime)
+                    with open(latest_file, 'r') as f:
+                        import json
+                        return json.load(f)
+            
+            return None
+                                        
+        except Exception as e:
+            logging.error(f"Error loading feature information: {e}")
+            return None
