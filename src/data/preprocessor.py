@@ -579,6 +579,36 @@ class Preprocessor:
             df['Close'] = df[close_col]
             logging.info(f"Using '{close_col}' as the Close price column")
         
+        # Reorganize columns to ensure important features come first
+        if 'Close' in df.columns:
+            # Define desired priority columns
+            desired_priority_columns = ['Close', 'Open', 'High', 'Low', 'Volume']
+            
+            # Filter to only use priority columns that actually exist in the dataframe
+            priority_columns = [col for col in desired_priority_columns if col in df.columns]
+            
+            if priority_columns:
+                # Check if we have alternative names for standard columns
+                alt_cols = {}
+                for std_col in desired_priority_columns:
+                    if std_col not in df.columns:
+                        # Look for alternative columns containing the standard name
+                        alt_candidates = [col for col in df.columns if std_col.lower() in str(col).lower()]
+                        if alt_candidates:
+                            alt_cols[std_col] = alt_candidates[0]
+                
+                # Add alternative column names to priority columns
+                priority_columns.extend(alt_cols.values())
+                
+                # Get all other columns (excluding priority ones)
+                other_columns = [col for col in df.columns if col not in priority_columns]
+                
+                # Reorganize columns with priority columns first
+                df = df[priority_columns + other_columns]
+                logging.info(f"Reorganized columns to prioritize core price data: {priority_columns}")
+            else:
+                logging.warning("No standard price columns found for reorganization")
+        
         # Scale the closing prices for prediction
         close_prices = df['Close'].values.reshape(-1, 1)
         self.price_scaler.fit(close_prices)
@@ -623,6 +653,26 @@ class Preprocessor:
         
         # Save scalers info
         np.save(os.path.join(self.processed_dir, "feature_columns.npy"), feature_columns)
+        
+        # Save feature names for future reference
+        try:
+            feature_names = np.array(df.columns)
+            np.save(os.path.join(self.processed_dir, "feature_names.npy"), feature_names)
+            logging.info(f"Saved {len(feature_names)} feature names for reference")
+            
+            # Save priority feature information - more robust approach
+            priority_features = []
+            priority_patterns = ['close', 'open', 'high', 'low', 'volume']
+            
+            for col in df.columns:
+                col_lower = str(col).lower()
+                if any(pattern in col_lower for pattern in priority_patterns):
+                    priority_features.append(col)
+                    
+            np.save(os.path.join(self.processed_dir, "priority_features.npy"), priority_features)
+            logging.info(f"Saved {len(priority_features)} priority features: {priority_features}")
+        except Exception as e:
+            logging.warning(f"Could not save feature names: {e}")
         
         logging.info("Data processing complete and saved.")
         

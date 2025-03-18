@@ -224,6 +224,19 @@ def train_model(args):
             feature_dim=feature_dim
         )
         
+        # After the model is created and before training, log the input shape and feature dimensions
+        if hasattr(model, 'model') and model.model is not None:
+            try:
+                model_input_shape = model.model.input_shape
+                if model_input_shape is not None:
+                    logger.info(f"Model input shape for training: {model_input_shape}, features: {X_train.shape[2]}")
+                    
+                    # Check for mismatch
+                    if model_input_shape[-1] != X_train.shape[2]:
+                        logger.warning(f"Feature dimension mismatch during training: model expects {model_input_shape[-1]} but data has {X_train.shape[2]}")
+            except Exception as e:
+                logger.warning(f"Could not determine model input shape during training: {e}")
+        
         history = model.train(X_train, y_train, X_val=X_test, y_val=y_test, epochs=100)
     
     # Evaluate model
@@ -532,10 +545,70 @@ def trade(args):
                     if recent_window.shape[2] != model_feature_dim:
                         logger.warning(f"Feature dimension mismatch: data has {recent_window.shape[2]} features, model expects {model_feature_dim}")
                         
-                        # If we have too many features, truncate to match model's expectation
+                        # If we have too many features, make an informed decision about which to truncate
                         if recent_window.shape[2] > model_feature_dim:
-                            logger.info(f"Truncating features from {recent_window.shape[2]} to {model_feature_dim}")
-                            recent_window = recent_window[:, :, :model_feature_dim]
+                            # Load feature names if available
+                            feature_names = []
+                            priority_features = []
+                            try:
+                                processed_dir = os.path.join(os.path.dirname(__file__), "data", "processed")
+                                feature_names_path = os.path.join(processed_dir, "feature_names.npy")
+                                priority_path = os.path.join(processed_dir, "priority_features.npy")
+                                
+                                if os.path.exists(feature_names_path):
+                                    feature_names = np.load(feature_names_path, allow_pickle=True)
+                                    
+                                    # Check if we have priority features saved
+                                    if os.path.exists(priority_path):
+                                        priority_features = np.load(priority_path, allow_pickle=True)
+                                        logger.info(f"Loaded priority features: {priority_features}")
+                                        
+                                    if len(feature_names) >= recent_window.shape[2]:
+                                        # Identify candidates for removal - non-priority features at the end
+                                        candidates_for_removal = []
+                                        for i in range(len(feature_names)-1, -1, -1):  # Start from the end
+                                            if feature_names[i] not in priority_features:
+                                                candidates_for_removal.append(i)
+                                                if len(candidates_for_removal) >= (recent_window.shape[2] - model_feature_dim):
+                                                    break
+                                        
+                                        # If we found enough candidates for removal
+                                        if len(candidates_for_removal) >= (recent_window.shape[2] - model_feature_dim):
+                                            # Get the feature indices to keep
+                                            features_to_remove = sorted(candidates_for_removal[:recent_window.shape[2] - model_feature_dim])
+                                            features_to_remove_names = [feature_names[i] for i in features_to_remove]
+                                            logger.warning(f"Removing non-priority features: {features_to_remove_names}")
+                                            
+                                            # Create a boolean mask for keeping features
+                                            keep_mask = np.ones(recent_window.shape[2], dtype=bool)
+                                            keep_mask[features_to_remove] = False
+                                            
+                                            # Use the mask to select features
+                                            recent_window = recent_window[:, :, keep_mask]
+                                            logger.info(f"Selectively removed {len(features_to_remove)} non-priority features")
+                                        else:
+                                            # Fallback: just truncate from the end
+                                            truncated_features = feature_names[model_feature_dim:recent_window.shape[2]]
+                                            logger.warning(f"Will truncate feature(s): {truncated_features}")
+                                            logger.info(f"Last retained feature: {feature_names[model_feature_dim-1]}")
+                                            recent_window = recent_window[:, :, :model_feature_dim]
+                                    else:
+                                        # Fallback if feature names don't match count
+                                        logger.warning("Feature names length doesn't match data dimensions, truncating from end.")
+                                        recent_window = recent_window[:, :, :model_feature_dim]
+                                else:
+                                    logger.warning("Feature names file not found. Truncating features without feature identification.")
+                                    recent_window = recent_window[:, :, :model_feature_dim]
+                            except Exception as e:
+                                logger.warning(f"Could not load feature names: {e}")
+                                # Default truncation if something goes wrong
+                                recent_window = recent_window[:, :, :model_feature_dim]
+                            
+                            logger.info(f"Final feature count after adjustment: {recent_window.shape[2]}")
+                        # If we have too few features, we'd need to handle that case as well
+                        elif recent_window.shape[2] < model_feature_dim:
+                            logger.error(f"Data has fewer features than model expects: {recent_window.shape[2]} vs {model_feature_dim}")
+                            raise ValueError(f"Insufficient features: model expects {model_feature_dim} but data has {recent_window.shape[2]}")
             except AttributeError:
                 # Method 2: Try alternative way to get input shape
                 try:
@@ -548,9 +621,31 @@ def trade(args):
                         if recent_window.shape[2] != model_feature_dim:
                             logger.warning(f"Feature dimension mismatch: data has {recent_window.shape[2]} features, model expects {model_feature_dim}")
                             
+                            # If we have too many features, make an informed decision about which to truncate
                             if recent_window.shape[2] > model_feature_dim:
+                                # Load feature names if available
+                                feature_names = []
+                                try:
+                                    processed_dir = os.path.join(os.path.dirname(__file__), "data", "processed")
+                                    feature_names_path = os.path.join(processed_dir, "feature_names.npy")
+                                    if os.path.exists(feature_names_path):
+                                        feature_names = np.load(feature_names_path, allow_pickle=True)
+                                        if len(feature_names) >= recent_window.shape[2]:
+                                            truncated_features = feature_names[model_feature_dim:recent_window.shape[2]]
+                                            logger.warning(f"Will truncate feature(s): {truncated_features}")
+                                            logger.info(f"Last retained feature: {feature_names[model_feature_dim-1]}")
+                                    else:
+                                        logger.warning("Feature names file not found. Truncating features without feature identification.")
+                                except Exception as e:
+                                    logger.warning(f"Could not load feature names: {e}")
+                                
+                                # Truncate to match model's expectation
                                 logger.info(f"Truncating features from {recent_window.shape[2]} to {model_feature_dim}")
                                 recent_window = recent_window[:, :, :model_feature_dim]
+                            # If we have too few features, we'd need to handle that case as well
+                            elif recent_window.shape[2] < model_feature_dim:
+                                logger.error(f"Data has fewer features than model expects: {recent_window.shape[2]} vs {model_feature_dim}")
+                                raise ValueError(f"Insufficient features: model expects {model_feature_dim} but data has {recent_window.shape[2]}")
                 except Exception as e:
                     logger.warning(f"Could not determine model input shape from config: {e}")
                     # Just use the expected features from training data
@@ -570,7 +665,6 @@ def trade(args):
         # Log raw predictions before scaling
         logging.info(f"Raw model predictions: {predictions[0]}")
         
-        # Check if predictions seem reasonable (basic sanity check)
         if preprocessor.price_scaler is not None:
             try:
                 # Reshape for inverse transform
@@ -627,7 +721,7 @@ def trade(args):
     except Exception as e:
         logger.error(f"Prediction failed: {e}")
         
-        # Fallback: use recent prices and add small random variations
+        # Fallback: use recent prices and add small random variation
         logger.warning("Using fallback prediction method based on recent prices")
         
         # Get last known price (convert to scalar)
@@ -710,6 +804,8 @@ def trade(args):
         risk_factor=args.risk_factor,
         stop_loss_pct=args.stop_loss,
         trailing_stop_pct=args.trailing_stop,
+        max_trades_per_day=args.max_trades_per_day,
+        max_drawdown_pct=args.max_drawdown,
         volatility_scaling=args.volatility_scaling,
         window_size=args.window_size,
         prediction_horizon=args.prediction_horizon  # Pass the prediction horizon explicitly
@@ -766,7 +862,6 @@ def trade(args):
         
         # Get day-specific momentum
         daily_momentum = momentum[i]
-        
         # Day-to-day change
         day_change = day_to_day_changes[i]
         
@@ -872,7 +967,7 @@ def trade(args):
     
     if hist_prices is not None:
         plt.plot(range(len(hist_dates)), hist_prices, 'b-', label='Historical')
-     
+    
     # Plot raw predictions
     pred_prices = predictions[0]
     plt.plot(range(len(hist_dates), len(hist_dates) + len(pred_prices)), 
@@ -918,25 +1013,19 @@ def main():
     try:
         if args.mode == 'train':
             model, preprocessor, X_test, y_test = train_model(args)
-            
             # Also run test after training
             test_model(args, model, preprocessor)
-            
         elif args.mode == 'test':
             test_model(args)
-            
         elif args.mode == 'trade':
             trade(args)
-            
-        # Add a new mode for visualizing metrics history
         elif args.mode == 'visualize-metrics':
+            # Add a new mode for visualizing metrics history
             visualizer = MetricsVisualizer()
             metrics_path = visualizer.plot_training_history(n_iterations=args.num_iterations if hasattr(args, 'num_iterations') else 10)
             logger.info(f"Metrics history visualization created: {metrics_path}")
-            
         else:
             logger.error(f"Unknown mode: {args.mode}")
-    
     except Exception as e:
         logger.error(f"Error during execution: {e}", exc_info=True)
         return 1
