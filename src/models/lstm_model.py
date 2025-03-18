@@ -2,7 +2,7 @@ import os
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.models import Sequential, load_model
-from tensorflow.keras.layers import LSTM, Dense, Dropout, BatchNormalization
+from tensorflow.keras.layers import LSTM, Dense, Dropout, BatchNormalization, Input
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 from tensorflow.keras.optimizers import Adam
 import logging
@@ -30,32 +30,35 @@ class LSTMModel:
             dropout_rate: Dropout rate for regularization
             learning_rate: Learning rate for Adam optimizer
         """
-        # Clear previous Tensorflow session to avoid memory issues
+        # Use TF's recommended method to clear session instead of deprecated reset_default_graph
         tf.keras.backend.clear_session()
         
-        # Create Sequential model
-        model = Sequential()
-        
-        # First LSTM layer with return sequences for stacking
-        model.add(LSTM(
-            units=lstm_units,
-            return_sequences=True,
-            input_shape=(self.window_size, self.feature_dim)
-        ))
-        model.add(BatchNormalization())
-        model.add(Dropout(dropout_rate))
-        
-        # Second LSTM layer (deeper network)
-        model.add(LSTM(units=int(lstm_units/2), return_sequences=False))
-        model.add(BatchNormalization())
-        model.add(Dropout(dropout_rate))
-        
-        # Dense hidden layer for additional pattern recognition
-        model.add(Dense(units=64, activation='relu'))
-        model.add(Dropout(dropout_rate/2))
-        
-        # Output layer (predicting multiple days ahead)
-        model.add(Dense(units=self.prediction_horizon))
+        # Create Sequential model with proper input specification
+        model = Sequential([
+            # Input layer with explicit shape
+            Input(shape=(self.window_size, self.feature_dim), name='input_layer'),
+            
+            # First LSTM layer with return sequences for stacking
+            LSTM(
+                units=lstm_units,
+                return_sequences=True,
+                name='lstm_1'
+            ),
+            BatchNormalization(name='batch_norm_1'),
+            Dropout(dropout_rate, name='dropout_1'),
+            
+            # Second LSTM layer
+            LSTM(units=int(lstm_units/2), return_sequences=False, name='lstm_2'),
+            BatchNormalization(name='batch_norm_2'),
+            Dropout(dropout_rate, name='dropout_2'),
+            
+            # Dense hidden layer for additional pattern recognition
+            Dense(units=64, activation='relu', name='dense_1'),
+            Dropout(dropout_rate/2, name='dropout_3'),
+            
+            # Output layer (predicting multiple days ahead)
+            Dense(units=self.prediction_horizon, name='output')
+        ])
         
         # Compile model with Adam optimizer and MSE loss
         model.compile(
@@ -65,6 +68,7 @@ class LSTMModel:
         )
         
         logging.info(f"LSTM model built with {lstm_units} units, {dropout_rate} dropout rate")
+        logging.info(f"Model summary: {model.summary()}")
         self.model = model
         return model
     
