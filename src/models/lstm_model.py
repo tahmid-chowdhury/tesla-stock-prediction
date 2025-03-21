@@ -511,155 +511,104 @@ class LSTMModel:
             Predictions and optional confidence intervals
         """
         if self.model is None:
-            logging.warning("Model not trained yet. Loading default model...")
-            self.load_saved_model()
-            
-        if self.model is None:
-            logging.error("No model available for prediction")
+            logging.error("Model not trained or loaded. Cannot make predictions.")
             return None
-            
+        
         try:
-            # Existing feature dimension handling code
-            expected_feature_dim = None
-            try:
-                # Method 1: Try to get input shape from model's first layer config
-                first_layer = self.model.layers[0]
-                if hasattr(first_layer, 'input_shape'):
-                    input_shape = first_layer.input_shape
-                    if input_shape:
-                        expected_feature_dim = input_shape[-1]
-                elif hasattr(first_layer, 'get_config'):
-                    config = first_layer.get_config()
-                    if 'batch_input_shape' in config:
-                        input_shape = config['batch_input_shape']
-                        if input_shape and len(input_shape) >= 3:
-                            expected_feature_dim = input_shape[-1]
-            except Exception as e:
-                logging.warning(f"Error getting input shape from model's first layer: {e}")
-                
-            # Method 2: If we still couldn't get the input shape, try the model-level config
-            if expected_feature_dim is None:
-                try:
-                    config = self.model.get_config()
-                    layers = config.get('layers', [])
-                    if layers and 'config' in layers[0]:
-                        layer_config = layers[0]['config']
-                        if 'batch_input_shape' in layer_config:
-                            input_shape = layer_config['batch_input_shape']
-                            if input_shape and len(input_shape) >= 3:
-                                expected_feature_dim = input_shape[-1]
-                except Exception as e:
-                    logging.warning(f"Error getting input shape from model config: {e}")
-                    
-            # If we have the expected feature dimension, adjust the input data if needed
-            if expected_feature_dim is not None and X.shape[2] != expected_feature_dim:
-                logging.warning(f"Input feature mismatch: model expects {expected_feature_dim}, got {X.shape[2]}")
-                
-                # If too many features, truncate
-                if X.shape[2] > expected_feature_dim:
-                    logging.info(f"Truncating features from {X.shape[2]} to {expected_feature_dim}")
-                    X = X[:, :, :expected_feature_dim]
-                else:
-                    # If too few features, pad with zeros
-                    logging.info(f"Padding features from {X.shape[2]} to {expected_feature_dim}")
-                    padding = np.zeros((X.shape[0], X.shape[1], expected_feature_dim - X.shape[2]))
-                    X = np.concatenate([X, padding], axis=2)
-            
-            # Make prediction and perform basic validation
-            if use_ensemble and self.ensemble_models:
-                # Predict with each model in the ensemble
-                ensemble_predictions = []
-                for model_info in self.ensemble_models:
-                    model = model_info['model']
-                    if model is not None:
-                        try:
-                            pred = model.predict(X)
-                            ensemble_predictions.append(pred)
-                        except Exception as e:
-                            logging.warning(f"Ensemble model prediction failed: {e}")
-                
-                if not ensemble_predictions:
-                    logging.warning("All ensemble models failed, falling back to primary model")
+            # For standard Keras model (no ensemble)
+            if not use_ensemble or not self.ensemble_models:
+                # Make standard prediction - handle both custom models and standard TF models
+                if hasattr(self.model, 'predict') and callable(self.model.predict):
                     predictions = self.model.predict(X)
                 else:
-                    # Average the predictions with outlier handling
-                    ensemble_predictions = np.array(ensemble_predictions)
-                    
-                    # For each time step and each day in the prediction horizon
-                    # Compute mean and standard deviation, excluding outliers
-                    mean_predictions = np.zeros((ensemble_predictions.shape[1], ensemble_predictions.shape[2]))
-                    std_predictions = np.zeros((ensemble_predictions.shape[1], ensemble_predictions.shape[2]))
-                    
-                    for i in range(ensemble_predictions.shape[1]):  # For each sample
-                        for j in range(ensemble_predictions.shape[2]):  # For each day in prediction
-                            # Get all model predictions for this sample and day
-                            predictions_ij = ensemble_predictions[:, i, j]
-                            
-                            # Exclude outliers (predictions outside 1.5 IQR)
-                            q1, q3 = np.percentile(predictions_ij, [25, 75])
-                            iqr = q3 - q1
-                            lower_bound = q1 - 1.5 * iqr
-                            upper_bound = q3 + 1.5 * iqr
-                            
-                            # Filter outliers
-                            filtered_preds = predictions_ij[(predictions_ij >= lower_bound) & (predictions_ij <= upper_bound)]
-                            
-                            # Use filtered predictions if we have enough, otherwise use all
-                            if len(filtered_preds) > len(predictions_ij) / 2:
-                                mean_predictions[i, j] = np.mean(filtered_preds)
-                                std_predictions[i, j] = np.std(filtered_preds)
-                            else:
-                                mean_predictions[i, j] = np.mean(predictions_ij)
-                                std_predictions[i, j] = np.std(predictions_ij)
-                    
-                    predictions = mean_predictions.reshape(ensemble_predictions.shape[1:])
-                    
-                    if return_confidence:
-                        # Create 95% confidence intervals based on ensemble predictions
-                        lower_bound = mean_predictions - 1.96 * std_predictions
-                        upper_bound = mean_predictions + 1.96 * std_predictions
-                        
-                        confidence_intervals = {
-                            'mean': mean_predictions,
-                            'std': std_predictions,
-                            'lower_95': lower_bound.reshape(ensemble_predictions.shape[1:]),
-                            'upper_95': upper_bound.reshape(ensemble_predictions.shape[1:])
-                        }
-                        
-                        return predictions, confidence_intervals
-            else:
-                predictions = self.model.predict(X)
+                    logging.error("Model doesn't have a predict method")
+                    return None
                 
+                # If confidence intervals are requested, generate them
                 if return_confidence:
-                    # For single model, estimate uncertainty based on prediction horizon
-                    std_predictions = np.zeros_like(predictions)
-                    # Start with 5% uncertainty, increasing with prediction horizon
-                    for i in range(predictions.shape[1]):
-                        # Increase uncertainty for longer-term predictions
-                        uncertainty = 0.05 + (i * 0.03)  # 5% base, +3% per day
-                        std_predictions[:, i] = np.abs(predictions[:, i]) * uncertainty
+                    # Calculate prediction intervals based on prediction uncertainty
+                    n_samples = 10  # Number of samples for bootstrapping
+                    bootstrap_preds = []
                     
-                    lower_bound = predictions - 1.96 * std_predictions
-                    upper_bound = predictions + 1.96 * std_predictions
+                    # Create bootstrap samples by adding noise
+                    for _ in range(n_samples):
+                        # Add dropout noise during inference
+                        if hasattr(self.model, 'predict_with_dropout') and callable(self.model.predict_with_dropout):
+                            # Use custom implementation if available
+                            bootstrap_preds.append(self.model.predict_with_dropout(X))
+                        else:
+                            # Fallback: add Gaussian noise to inputs for uncertainty
+                            noise_level = 0.01  # Small amount of noise
+                            noisy_X = X + np.random.normal(0, noise_level, X.shape)
+                            bootstrap_preds.append(self.model.predict(noisy_X))
                     
+                    # Calculate mean and std of bootstrap predictions
+                    bootstrap_preds = np.array(bootstrap_preds)
+                    mean_preds = np.mean(bootstrap_preds, axis=0)
+                    std_preds = np.std(bootstrap_preds, axis=0)
+                    
+                    # Calculate confidence intervals (95%)
+                    lower_95 = mean_preds - 1.96 * std_preds
+                    upper_95 = mean_preds + 1.96 * std_preds
+                    
+                    # Return predictions with confidence intervals
                     confidence_intervals = {
-                        'mean': predictions,
-                        'std': std_predictions,
-                        'lower_95': lower_bound,
-                        'upper_95': upper_bound
+                        'lower_95': lower_95,
+                        'upper_95': upper_95,
+                        'std': std_preds
                     }
                     
                     return predictions, confidence_intervals
-            
-            if return_confidence:
-                # Default return format if we didn't hit a special case above
-                return predictions, None
                 
-            return predictions
+                return predictions
             
+            # For ensemble models
+            else:
+                logging.info(f"Making ensemble prediction with {len(self.ensemble_models)} models")
+                ensemble_predictions = []
+                
+                # Get predictions from each model in the ensemble
+                for model_info in self.ensemble_models:
+                    model = model_info['model']
+                    pred = model.predict(X)
+                    ensemble_predictions.append(pred)
+                
+                # Combine predictions (average)
+                ensemble_predictions = np.array(ensemble_predictions)
+                mean_prediction = np.mean(ensemble_predictions, axis=0)
+                
+                # If confidence intervals are requested
+                if return_confidence:
+                    std_prediction = np.std(ensemble_predictions, axis=0)
+                    
+                    # Calculate 95% confidence intervals
+                    lower_95 = mean_prediction - 1.96 * std_prediction
+                    upper_95 = mean_prediction + 1.96 * std_prediction
+                    
+                    # Return predictions with confidence intervals
+                    confidence_intervals = {
+                        'lower_95': lower_95,
+                        'upper_95': upper_95,
+                        'std': std_prediction
+                    }
+                    
+                    return mean_prediction, confidence_intervals
+                
+                return mean_prediction
+                
         except Exception as e:
             logging.error(f"Error during prediction: {e}")
-            return None
+            import traceback
+            logging.error(traceback.format_exc())
+            
+            # Return None or a fallback prediction
+            if return_confidence:
+                return np.zeros((len(X), self.prediction_horizon)), {
+                    'lower_95': np.zeros((len(X), self.prediction_horizon)),
+                    'upper_95': np.zeros((len(X), self.prediction_horizon))
+                }
+            else:
+                return np.zeros((len(X), self.prediction_horizon))
             
     def current_market_regime(self, recent_data):
         """

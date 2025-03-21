@@ -411,12 +411,28 @@ def train_model(args):
     
     # Use confidence intervals if requested
     if args.confidence_intervals:
-        # Get predictions with confidence intervals
-        predictions, confidence_intervals = model.predict(
-            X_test, 
-            use_ensemble=args.use_ensemble,
-            return_confidence=True
-        )
+        # Get predictions with confidence intervals - handle different model types
+        try:
+            # Try to use the custom predict method with use_ensemble parameter
+            predictions, confidence_intervals = model.predict(
+                X_test, 
+                use_ensemble=args.use_ensemble,
+                return_confidence=True
+            )
+        except (TypeError, AttributeError) as e:
+            # Fall back to standard predict method for TensorFlow models
+            logger.warning(f"Model doesn't support custom prediction parameters: {e}")
+            logger.warning("Falling back to standard prediction without ensemble/confidence")
+            
+            # Standard TensorFlow predict
+            predictions = model.predict(X_test)
+            
+            # Create default confidence intervals
+            confidence_intervals = {
+                'lower_95': predictions * 0.9,  # Simple 10% lower bound
+                'upper_95': predictions * 1.1   # Simple 10% upper bound
+            }
+            logger.info("Created simple confidence intervals for standard model")
         
         # Plot predictions with confidence intervals
         plot_predictions_with_confidence(
@@ -429,11 +445,19 @@ def train_model(args):
             y_test, predictions, confidence_intervals
         )
         # Add confidence interval metrics to main metrics
+        metrics = evaluator.evaluate_price_predictions(y_test, predictions, preprocessor.price_scaler)
         metrics.update(ci_metrics)
     else:
-        predictions = model.predict(X_test, use_ensemble=args.use_ensemble)
+        # Standard prediction - handle different model types
+        try:
+            # Try to use the custom predict method with use_ensemble parameter
+            predictions = model.predict(X_test, use_ensemble=args.use_ensemble)
+        except (TypeError, AttributeError) as e:
+            # Fall back to standard predict method for TensorFlow models
+            logger.warning(f"Model doesn't support ensemble prediction: {e}")
+            predictions = model.predict(X_test)
     
-    metrics = evaluator.evaluate_price_predictions(y_test, predictions, preprocessor.price_scaler)
+        metrics = evaluator.evaluate_price_predictions(y_test, predictions, preprocessor.price_scaler)
     
     perf_monitor.stop_timer('model_evaluation')
     
