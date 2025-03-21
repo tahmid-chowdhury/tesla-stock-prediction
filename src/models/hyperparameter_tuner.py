@@ -206,6 +206,9 @@ class HyperparameterTuner:
             # Start the hyperparameter search
             logging.info(f"Starting hyperparameter search with {self.max_trials} trials")
             
+            # Clear TensorFlow session - use proper TF2 calls to avoid deprecation warnings
+            tf.keras.backend.clear_session()
+            
             # Run the standard Keras tuner search
             tuner.search(
                 X_train, y_train,

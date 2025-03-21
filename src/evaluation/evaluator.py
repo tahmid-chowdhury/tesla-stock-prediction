@@ -4,6 +4,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
 import logging
+from datetime import datetime
+from scipy import stats
 
 # Try to import seaborn, but don't fail if it's not available
 try:
@@ -24,150 +26,306 @@ class ModelEvaluator:
         self.results_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "results")
         os.makedirs(self.results_dir, exist_ok=True)
     
-    def evaluate_price_predictions(self, y_true, y_pred, price_scaler=None):
+    def evaluate_price_predictions(self, actual, predicted, scaler=None):
         """
-        Evaluate price prediction accuracy with enhanced metrics
+        Evaluate price predictions with enhanced metrics
+        
+        Args:
+            actual: Actual price values
+            predicted: Predicted price values
+            scaler: Optional scaler for transforming values back to original scale
+            
+        Returns:
+            Dictionary of evaluation metrics
         """
-        # If scaler is provided, inverse transform to original price scale
-        if price_scaler is not None:
-            if len(y_true.shape) == 2:
-                y_true = price_scaler.inverse_transform(y_true)
-                y_pred = price_scaler.inverse_transform(y_pred)
+        if scaler:
+            # Reshape for inverse transform if necessary
+            if len(actual.shape) > 1:
+                actual_reshaped = actual.reshape(-1, actual.shape[-1])
+                predicted_reshaped = predicted.reshape(-1, predicted.shape[-1])
             else:
-                # Reshape to 2D if needed
-                y_true_reshaped = y_true.reshape(-1, y_true.shape[-1])
-                y_pred_reshaped = y_pred.reshape(-1, y_pred.shape[-1])
+                actual_reshaped = actual.reshape(-1, 1)
+                predicted_reshaped = predicted.reshape(-1, 1)
                 
-                y_true = price_scaler.inverse_transform(y_true_reshaped).reshape(y_true.shape)
-                y_pred = price_scaler.inverse_transform(y_pred_reshaped).reshape(y_pred.shape)
-                
-        # Calculate regression metrics
-        mse = np.mean((y_true - y_pred) ** 2)
+            # Transform back to original scale
+            actual_orig = scaler.inverse_transform(actual_reshaped)
+            predicted_orig = scaler.inverse_transform(predicted_reshaped)
+            
+            # Reshape back if necessary
+            if len(actual.shape) > 1:
+                actual_values = actual_orig.reshape(actual.shape)
+                predicted_values = predicted_orig.reshape(predicted.shape)
+            else:
+                actual_values = actual_orig.flatten()
+                predicted_values = predicted_orig.flatten()
+        else:
+            actual_values = actual
+            predicted_values = predicted
+        
+        # Basic metrics
+        mse = np.mean((actual_values - predicted_values) ** 2)
         rmse = np.sqrt(mse)
-        mae = np.mean(np.abs(y_true - y_pred))
-        mape = np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+        mae = np.mean(np.abs(actual_values - predicted_values))
         
-        # Calculate directional accuracy (up/down)
-        y_true_dir = np.diff(y_true, axis=1) > 0
-        y_pred_dir = np.diff(y_pred, axis=1) > 0
+        # Mean Absolute Percentage Error
+        mape = np.mean(np.abs((actual_values - predicted_values) / actual_values)) * 100
         
-        direction_correct = np.mean(y_true_dir == y_pred_dir)
+        # Direction accuracy - whether prediction correctly captures up/down movement
+        actual_direction = np.sign(np.diff(actual_values, axis=0))
+        predicted_direction = np.sign(np.diff(predicted_values, axis=0))
         
-        # Calculate additional metrics
-        
-        # MAPE (Mean Absolute Percentage Error)
-        mape = np.mean(np.abs((y_true - y_pred) / y_true)) * 100
-        
-        # Calculate price direction prediction accuracy (up or down)
-        # For multi-step predictions, we calculate for each step
-        direction_accuracies = []
-        for i in range(1, y_true.shape[1]):
-            y_true_dir = (y_true[:, i] > y_true[:, i-1])
-            y_pred_dir = (y_pred[:, i] > y_pred[:, i-1])
-            direction_accuracies.append(np.mean(y_true_dir == y_pred_dir))
-        
-        overall_direction_accuracy = np.mean(direction_accuracies)
-        
-        # Generate directional trading signals (1: Buy, 0: Hold, -1: Sell)
-        y_true_signals = np.zeros_like(y_true[:, :-1])
-        y_pred_signals = np.zeros_like(y_pred[:, :-1])
-        
-        # Signal is Buy if price increases more than 1%, Sell if decreases more than 1%, else Hold
-        threshold = 0.01  # 1%
-        
-        for i in range(y_true.shape[1]-1):
-            y_true_pct_change = (y_true[:, i+1] - y_true[:, i]) / y_true[:, i]
-            y_pred_pct_change = (y_pred[:, i+1] - y_pred[:, i]) / y_pred[:, i]
+        # Flatten if multidimensional
+        if len(actual_direction.shape) > 1:
+            actual_direction = actual_direction.flatten()
+            predicted_direction = predicted_direction.flatten()
             
-            # True signals
-            y_true_signals[:, i] = np.where(y_true_pct_change > threshold, 1, 
-                                            np.where(y_true_pct_change < -threshold, -1, 0))
+        # Replace any zeros with small positive value to avoid ambiguity
+        actual_direction[actual_direction == 0] = 0.1
+        predicted_direction[predicted_direction == 0] = 0.1
+        
+        direction_match = (actual_direction * predicted_direction) > 0
+        direction_accuracy = np.mean(direction_match)
+        
+        # Calculate additional metrics for trading signals
+        # Consider prediction as "buy" signal if predicted price goes up
+        buy_signals = predicted_direction > 0
+        
+        # Calculate binary classification metrics
+        actual_up = actual_direction > 0
+        accuracy = accuracy_score(actual_up, buy_signals)
+        
+        # Precision, recall, F1-score
+        try:
+            precision = np.sum((buy_signals == True) & (actual_up == True)) / np.sum(buy_signals)
+        except ZeroDivisionError:
+            precision = 0
             
-            # Predicted signals
-            y_pred_signals[:, i] = np.where(y_pred_pct_change > threshold, 1, 
-                                           np.where(y_pred_pct_change < -threshold, -1, 0))
-        
-        # Flatten for classification metrics
-        y_true_signals_flat = y_true_signals.flatten()
-        y_pred_signals_flat = y_pred_signals.flatten()
-        
-        # Only calculate classification metrics if we have more than one class
-        unique_classes = np.unique(np.concatenate([y_true_signals_flat, y_pred_signals_flat]))
-        
-        classification_metrics = {}
-        if len(unique_classes) > 1:
-            # Convert to classes compatible with sklearn
-            y_true_classes = y_true_signals_flat + 1  # Convert from [-1,0,1] to [0,1,2]
-            y_pred_classes = y_pred_signals_flat + 1
+        try:
+            recall = np.sum((buy_signals == True) & (actual_up == True)) / np.sum(actual_up)
+        except ZeroDivisionError:
+            recall = 0
             
-            # Calculate classification metrics
-            try:
-                classification_metrics = {
-                    'accuracy': accuracy_score(y_true_classes, y_pred_classes),
-                    'precision': precision_score(y_true_classes, y_pred_classes, average='weighted', zero_division=0),
-                    'recall': recall_score(y_true_classes, y_pred_classes, average='weighted', zero_division=0),
-                    'f1': f1_score(y_true_classes, y_pred_classes, average='weighted', zero_division=0)
-                }
-                
-                # Create confusion matrix for signal prediction
-                cm = confusion_matrix(y_true_classes, y_pred_classes)
-                
-                # Plot confusion matrix
-                plt.figure(figsize=(10, 8))
-                if SEABORN_AVAILABLE:
-                    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                              xticklabels=['Sell', 'Hold', 'Buy'],
-                              yticklabels=['Sell', 'Hold', 'Buy'])
-                else:
-                    plt.imshow(cm, interpolation='nearest', cmap='Blues')
-                    plt.colorbar()
-                    
-                    # Add labels and values to the plot
-                    tick_marks = np.arange(3)
-                    plt.xticks(tick_marks, ['Sell', 'Hold', 'Buy'])
-                    plt.yticks(tick_marks, ['Sell', 'Hold', 'Buy'])
-                    
-                    # Add text annotations for values
-                    for i in range(cm.shape[0]):
-                        for j in range(cm.shape[1]):
-                            plt.text(j, i, format(cm[i, j], 'd'),
-                                    ha="center", va="center",
-                                    color="white" if cm[i, j] > cm.max() / 2 else "black")
-                
-                plt.title('Trading Signal Confusion Matrix')
-                plt.xlabel('Predicted Signal')
-                plt.ylabel('True Signal')
-                plt.tight_layout()
-                plt.savefig(os.path.join(self.results_dir, 'signal_confusion_matrix.png'))
-                plt.close()
-            except Exception as e:
-                logging.warning(f"Could not calculate classification metrics: {e}")
+        try:
+            f1 = 2 * (precision * recall) / (precision + recall)
+        except ZeroDivisionError:
+            f1 = 0
         
-        # Save results to CSV with added metrics
-        results = {
-            'Metric': ['MSE', 'RMSE', 'MAE', 'MAPE', 'Direction Accuracy'],
-            'Value': [mse, rmse, mae, mape, overall_direction_accuracy]
-        }
+        # Calculate Sharpe ratio-like metric for predicted returns
+        predicted_returns = np.diff(predicted_values, axis=0) / predicted_values[:-1]
+        actual_returns = np.diff(actual_values, axis=0) / actual_values[:-1]
         
-        # Add classification metrics if available
-        for metric, value in classification_metrics.items():
-            results['Metric'].append(f'Signal {metric.capitalize()}')
-            results['Value'].append(value)
+        if len(predicted_returns.shape) > 1:
+            predicted_returns = predicted_returns.flatten()
+            actual_returns = actual_returns.flatten()
         
-        results_df = pd.DataFrame(results)
-        results_df.to_csv(os.path.join(self.results_dir, 'price_prediction_metrics.csv'), index=False)
+        # Sharpe ratio (assuming daily data, annualized)
+        pred_sharpe = np.sqrt(252) * np.mean(predicted_returns) / np.std(predicted_returns) if np.std(predicted_returns) > 0 else 0
+        actual_sharpe = np.sqrt(252) * np.mean(actual_returns) / np.std(actual_returns) if np.std(actual_returns) > 0 else 0
         
-        # Return all metrics
-        metrics_dict = {
-            'mse': mse,
+        # Information coefficient - correlation between predicted and actual returns
+        try:
+            ic = np.corrcoef(predicted_returns, actual_returns)[0, 1]
+        except:
+            ic = 0
+            
+        # Maximum drawdown analysis
+        actual_mdd = self.calculate_max_drawdown(actual_values)
+        pred_mdd = self.calculate_max_drawdown(predicted_values)
+            
+        # Collect all metrics
+        metrics = {
             'rmse': rmse,
             'mae': mae,
             'mape': mape,
-            'direction_accuracy': overall_direction_accuracy
+            'direction_accuracy': direction_accuracy,
+            'accuracy': accuracy,
+            'precision': precision,
+            'recall': recall,
+            'f1': f1,
+            'information_coefficient': ic,
+            'pred_sharpe': pred_sharpe,
+            'actual_sharpe': actual_sharpe,
+            'actual_max_drawdown': actual_mdd,
+            'pred_max_drawdown': pred_mdd
         }
-        metrics_dict.update(classification_metrics)
         
-        return metrics_dict
+        # Log the metrics
+        logging.info("Prediction Evaluation Metrics:")
+        logging.info(f"RMSE: {rmse:.4f}")
+        logging.info(f"MAE: {mae:.4f}")
+        logging.info(f"MAPE: {mape:.2f}%")
+        logging.info(f"Direction Accuracy: {direction_accuracy:.4f}")
+        logging.info(f"Buy Signal Accuracy: {accuracy:.4f}")
+        logging.info(f"F1 Score: {f1:.4f}")
+        logging.info(f"Information Coefficient: {ic:.4f}")
+        
+        # Plot actual vs predicted values
+        self.plot_predictions(actual_values, predicted_values)
+        
+        return metrics
+    
+    def calculate_max_drawdown(self, prices):
+        """Calculate maximum drawdown from a series of prices"""
+        # Create a series of running maximum
+        if len(prices.shape) > 1:
+            prices = prices.flatten()
+            
+        running_max = np.maximum.accumulate(prices)
+        # Calculate drawdown as percentage from running maximum
+        drawdown = (running_max - prices) / running_max
+        # Get the maximum drawdown
+        max_drawdown = np.max(drawdown)
+        
+        return max_drawdown
+    
+    def detect_lookahead_bias(self, model, X_train, y_train, X_test, y_test, n_permutations=10):
+        """
+        Detect potential look-ahead bias in the model by testing permutations of future data
+        
+        Args:
+            model: The trained model
+            X_train, y_train: Training data
+            X_test, y_test: Test data
+            n_permutations: Number of permutations to test
+            
+        Returns:
+            Bias score (higher value indicates more look-ahead bias)
+        """
+        logging.info("Testing for look-ahead bias...")
+        
+        # Original performance
+        orig_predictions = model.predict(X_test)
+        orig_mse = mean_squared_error(y_test, orig_predictions)
+        
+        # Permutation test
+        permutation_scores = []
+        
+        for i in range(n_permutations):
+            # Create permuted test set with randomized future data
+            X_permuted = X_test.copy()
+            
+            # For time series data, shuffle the time dimension within each sample
+            # This simulates having access to "future" data in a random order
+            for j in range(X_permuted.shape[0]):
+                # Get indices except the last few (which are used for prediction)
+                indices = np.arange(X_permuted.shape[1] - 5)
+                np.random.shuffle(indices)
+                
+                # Apply shuffled indices
+                X_permuted[j, :-5, :] = X_permuted[j, indices, :]
+            
+            # Test model on permuted data
+            perm_predictions = model.predict(X_permuted)
+            perm_mse = mean_squared_error(y_test, perm_predictions)
+            
+            # Calculate ratio of original MSE to permuted MSE
+            # A value close to 1 suggests look-ahead bias (model works well even with shuffled data)
+            ratio = orig_mse / perm_mse if perm_mse > 0 else 1.0
+            permutation_scores.append(ratio)
+            
+        # Average bias score - closer to 1 means high risk of look-ahead bias
+        bias_score = np.mean(permutation_scores)
+        
+        # Assess bias risk
+        if bias_score > 0.9:
+            logging.warning(f"High risk of look-ahead bias detected (score: {bias_score:.4f})")
+        elif bias_score > 0.75:
+            logging.warning(f"Moderate risk of look-ahead bias detected (score: {bias_score:.4f})")
+        else:
+            logging.info(f"Low risk of look-ahead bias (score: {bias_score:.4f})")
+        
+        return bias_score
+    
+    def evaluate_confidence_intervals(self, actual, predictions, confidence_intervals):
+        """
+        Evaluate the quality of prediction confidence intervals
+        
+        Args:
+            actual: Actual values
+            predictions: Predicted values
+            confidence_intervals: Dict with lower and upper confidence bounds
+            
+        Returns:
+            Metrics on confidence interval quality
+        """
+        if confidence_intervals is None:
+            return {}
+            
+        # Extract bounds
+        lower_bounds = confidence_intervals['lower_95']
+        upper_bounds = confidence_intervals['upper_95']
+        
+        # Calculate coverage (percentage of actual values within confidence interval)
+        within_bounds = (actual >= lower_bounds) & (actual <= upper_bounds)
+        coverage = np.mean(within_bounds)
+        
+        # Calculate average interval width
+        interval_width = np.mean(upper_bounds - lower_bounds)
+        
+        # Calculate interval score (proper scoring rule for interval forecasts)
+        # Lower is better - penalizes wide intervals and violations
+        alpha = 0.05  # for 95% confidence intervals
+        interval_score = np.mean(
+            (upper_bounds - lower_bounds) + 
+            (2/alpha) * (lower_bounds - actual) * (actual < lower_bounds) +
+            (2/alpha) * (actual - upper_bounds) * (actual > upper_bounds)
+        )
+        
+        metrics = {
+            'coverage': coverage,
+            'interval_width': interval_width,
+            'interval_score': interval_score
+        }
+        
+        logging.info(f"Confidence Interval Evaluation:")
+        logging.info(f"Coverage (target: 0.95): {coverage:.4f}")
+        logging.info(f"Average interval width: {interval_width:.4f}")
+        logging.info(f"Interval score (lower is better): {interval_score:.4f}")
+        
+        return metrics
+        
+    def plot_predictions(self, actual, predicted):
+        """Plot actual vs predicted values with visualization enhancements"""
+        # For multivariate predictions (multiple days ahead)
+        if len(actual.shape) > 1 and actual.shape[1] > 1:
+            plt.figure(figsize=(12, 8))
+            
+            # Plot the first day predictions
+            plt.subplot(2, 1, 1)
+            plt.plot(actual[:, 0], label='Actual', linewidth=2)
+            plt.plot(predicted[:, 0], label='Predicted', linestyle='--', linewidth=2)
+            plt.title('1-Day Ahead Predictions')
+            plt.xlabel('Time')
+            plt.ylabel('Price')
+            plt.legend()
+            plt.grid(True)
+            
+            # Plot the last day predictions
+            plt.subplot(2, 1, 2)
+            plt.plot(actual[:, -1], label='Actual', linewidth=2)
+            plt.plot(predicted[:, -1], label='Predicted', linestyle='--', linewidth=2)
+            plt.title(f'{actual.shape[1]}-Day Ahead Predictions')
+            plt.xlabel('Time')
+            plt.ylabel('Price')
+            plt.legend()
+            plt.grid(True)
+            
+        else:
+            # For univariate predictions
+            plt.figure(figsize=(12, 6))
+            plt.plot(actual, label='Actual', linewidth=2)
+            plt.plot(predicted, label='Predicted', linestyle='--', linewidth=2)
+            plt.title('Price Predictions')
+            plt.xlabel('Time')
+            plt.ylabel('Price')
+            plt.legend()
+            plt.grid(True)
+        
+        plt.tight_layout()
+        
+        # Save the plot
+        plt.savefig(os.path.join(self.results_dir, f'prediction_comparison_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png'))
+        plt.close()
     
     def evaluate_trading_decisions(self, transactions_df):
         """

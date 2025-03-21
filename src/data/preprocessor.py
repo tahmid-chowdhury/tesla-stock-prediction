@@ -7,18 +7,25 @@ from datetime import datetime, timedelta
 import ta
 from sklearn.preprocessing import MinMaxScaler, StandardScaler, RobustScaler
 from sklearn.model_selection import train_test_split
+from sklearn.cluster import KMeans
+import joblib
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class Preprocessor:
-    def __init__(self, window_size=30, prediction_horizon=5, test_size=0.2):
+    def __init__(self, window_size=15, prediction_horizon=5, test_size=0.2, detect_regimes=False, 
+                 num_regimes=3, reduced_features=False, feature_count=20):
         """
         Initialize Preprocessor with parameters
         
         Args:
-            window_size: Size of sliding window for feature creation (30 days)
+            window_size: Size of sliding window for feature creation (default 15 days)
             prediction_horizon: Number of days to predict ahead (5 days)
             test_size: Proportion of data to use for testing (0.2 = 20%)
+            detect_regimes: Whether to detect market regimes
+            num_regimes: Number of market regimes to detect
+            reduced_features: Whether to use only essential features for faster training
+            feature_count: Number of features to use when reduced_features is True
         """
         self.window_size = window_size
         self.prediction_horizon = prediction_horizon
@@ -30,6 +37,12 @@ class Preprocessor:
         self.price_scaler = MinMaxScaler()
         self.feature_scaler = StandardScaler()
         self.sentiment_scaler = RobustScaler()  # Better for sentiment data with outliers
+        self.detect_regimes = detect_regimes
+        self.num_regimes = num_regimes
+        self.regime_model = None
+        self.regime_scaler = None
+        self.reduced_features = reduced_features
+        self.feature_count = feature_count
         
         # Create directories if they don't exist
         os.makedirs(self.processed_dir, exist_ok=True)
@@ -204,8 +217,16 @@ class Preprocessor:
         # ATR - Average True Range (volatility indicator)
         df['ATR'] = ta.volatility.average_true_range(high_series, low_series, close_series, window=14)
         
-        # Parabolic SAR
-        df['PSAR'] = ta.trend.psar_down(high_series, low_series, close_series)
+        # Import our patched PSAR function to avoid the FutureWarning
+        try:
+            from src.utils.ta_utils import patched_psar
+            # Use patched PSAR implementation
+            df['PSAR'] = patched_psar(high_series, low_series, close_series)
+        except ImportError:
+            # Fall back to ta library if our patch is not available
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", FutureWarning)
+                df['PSAR'] = ta.trend.psar_down(high_series, low_series, close_series)
         
         # ADX - Average Directional Index
         df['ADX'] = ta.trend.adx(high_series, low_series, close_series, window=14)
@@ -609,6 +630,178 @@ class Preprocessor:
             logging.error(traceback.format_exc())
             return stock_data
     
+    def identify_market_regimes(self, price_data, volume_data=None, volatility_window=20):
+        """
+        Identify market regimes based on price, volume, and volatility patterns
+        
+        Args:
+            price_data: Historical price data
+            volume_data: Optional volume data
+            volatility_window: Window size for volatility calculation
+            
+        Returns:
+            Array of regime labels
+        """
+        if not self.detect_regimes:
+            return None
+            
+        # Calculate features for regime detection
+        features = []
+        
+        # 1. Price momentum: rate of change over different periods
+        for period in [5, 10, 20]:
+            momentum = np.zeros_like(price_data)
+            momentum[period:] = (price_data[period:] - price_data[:-period]) / price_data[:-period]
+            features.append(momentum)
+            
+        # 2. Volatility: standard deviation of returns
+        returns = np.zeros_like(price_data)
+        returns[1:] = (price_data[1:] - price_data[:-1]) / price_data[:-1]
+        
+        volatility = np.zeros_like(returns)
+        for i in range(volatility_window, len(returns)):
+            volatility[i] = np.std(returns[i-volatility_window:i])
+        features.append(volatility)
+        
+        # 3. Volume features if available
+        if volume_data is not None:
+            # Volume momentum
+            vol_momentum = np.zeros_like(volume_data)
+            vol_momentum[5:] = (volume_data[5:] - volume_data[:-5]) / (volume_data[:-5] + 1)  # Add 1 to avoid division by zero
+            features.append(vol_momentum)
+            
+            # Volume relative to moving average
+            vol_ma = np.zeros_like(volume_data)
+            for i in range(10, len(volume_data)):
+                vol_ma[i] = volume_data[i] / np.mean(volume_data[i-10:i])
+            features.append(vol_ma)
+        
+        # Combine features
+        feature_matrix = np.column_stack(features)
+        
+        # Handle NaN values
+        feature_matrix = np.nan_to_num(feature_matrix, nan=0.0)
+        
+        # Normalize features
+        from sklearn.preprocessing import StandardScaler
+        scaler = StandardScaler()
+        normalized_features = scaler.fit_transform(feature_matrix)
+        
+        # Apply KMeans clustering
+        kmeans = KMeans(n_clusters=self.num_regimes, random_state=42, n_init=10)
+        regimes = kmeans.fit_predict(normalized_features)
+        
+        # Save the regime model and scaler
+        self.regime_model = kmeans
+        self.regime_scaler = scaler
+        
+        processed_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data", "processed")
+        os.makedirs(processed_dir, exist_ok=True)
+        
+        joblib.dump(kmeans, os.path.join(processed_dir, "regime_model.joblib"))
+        joblib.dump(scaler, os.path.join(processed_dir, "regime_scaler.joblib"))
+        
+        # Log regime distribution
+        regime_counts = np.bincount(regimes)
+        regime_percentages = regime_counts / len(regimes) * 100
+        
+        logging.info(f"Market regime distribution:")
+        for i, (count, percentage) in enumerate(zip(regime_counts, regime_percentages)):
+            logging.info(f"Regime {i}: {count} days ({percentage:.1f}%)")
+            
+        # Save regime labels
+        np.save(os.path.join(processed_dir, "regime_labels.npy"), regimes)
+        
+        # Visualize regimes
+        self.visualize_regimes(price_data, regimes)
+        
+        return regimes
+    
+    def visualize_regimes(self, price_data, regimes):
+        """Create a visualization of price data colored by regime"""
+        plt.figure(figsize=(12, 6))
+        
+        # Create a time index
+        x = np.arange(len(price_data))
+        
+        # Get unique regimes
+        unique_regimes = np.unique(regimes)
+        
+        # Plot each regime with a different color
+        for regime in unique_regimes:
+            mask = regimes == regime
+            plt.plot(x[mask], price_data[mask], '.', label=f'Regime {regime}')
+        
+        plt.title('Market Regimes')
+        plt.xlabel('Time')
+        plt.ylabel('Price')
+        plt.legend()
+        plt.grid(True)
+        
+        # Save the visualization
+        plt.tight_layout()
+        results_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "results")
+        os.makedirs(results_dir, exist_ok=True)
+        plt.savefig(os.path.join(results_dir, f'market_regimes_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png'))
+        plt.close()
+    
+    def select_important_features(self, df, n_features=20):
+        """
+        Select the most important features to reduce dimensionality and speed up training
+        
+        Args:
+            df: DataFrame with features
+            n_features: Number of features to select
+            
+        Returns:
+            DataFrame with only the selected important features
+        """
+        # Always keep the core price columns
+        essential_columns = []
+        for col in df.columns:
+            col_str = str(col).lower()
+            if ('close' in col_str or 'open' in col_str or 'high' in col_str or 
+                'low' in col_str or 'volume' in col_str):
+                essential_columns.append(col)
+        
+        # Add important technical indicators
+        important_patterns = [
+            'ma_20', 'ma_50', 'ema_10', 'rsi', 'macd', 'bb_', 'atr',
+            'volatility', 'log_return', 'pct_change'
+        ]
+        
+        for pattern in important_patterns:
+            for col in df.columns:
+                col_str = str(col).lower()
+                if pattern in col_str and col not in essential_columns:
+                    essential_columns.append(col)
+                    if len(essential_columns) >= n_features:
+                        break
+            if len(essential_columns) >= n_features:
+                break
+        
+        # Add sentiment features if available
+        sentiment_cols = [col for col in df.columns if str(col).startswith('news_')]
+        for col in sentiment_cols:
+            if 'weighted' in str(col) or 'polarity' in str(col):
+                essential_columns.append(col)
+                if len(essential_columns) >= n_features:
+                    break
+        
+        # If we still need more features, add remaining columns until we reach n_features
+        if len(essential_columns) < n_features:
+            remaining_cols = [col for col in df.columns if col not in essential_columns]
+            additional_cols = remaining_cols[:n_features - len(essential_columns)]
+            essential_columns.extend(additional_cols)
+        
+        # Trim to exactly n_features if we have too many
+        essential_columns = essential_columns[:n_features]
+        
+        logging.info(f"Selected {len(essential_columns)} features: {essential_columns}")
+        
+        # Return DataFrame with only selected features
+        return df[essential_columns]
+    
     def prepare_data(self, stock_data):
         """
         Main function to prepare data for model training
@@ -754,6 +947,12 @@ class Preprocessor:
             # Update feature_columns after adjustment
             feature_columns = df_scaled.columns.tolist()
         
+        # Apply feature selection if requested
+        if self.reduced_features:
+            original_feature_count = len(df.columns)
+            df = self.select_important_features(df, n_features=self.feature_count)
+            logging.info(f"Reduced features from {original_feature_count} to {len(df.columns)} for faster training")
+        
         # Create sequences with sliding window
         X, y = self.create_sliding_windows(df_scaled)
         logging.info(f"Created sequences. X shape: {X.shape}, y shape: {y.shape}")
@@ -791,6 +990,38 @@ class Preprocessor:
             logging.info(f"Saved {len(priority_features)} priority features: {priority_features}")
         except Exception as e:
             logging.warning(f"Could not save feature names: {e}")
+        
+        # After preparing the data, add regime detection if requested
+        if self.detect_regimes and 'Close' in df.columns:
+            prices = df['Close'].values
+            volumes = df['Volume'].values if 'Volume' in df.columns else None
+            
+            # Identify market regimes
+            regimes = self.identify_market_regimes(prices, volumes)
+            
+            # Store regime information with prepared data
+            processed_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data", "processed")
+            os.makedirs(processed_dir, exist_ok=True)
+            
+            # Map regimes to the proper timeframe (accounting for windows)
+            if regimes is not None:
+                # The windowed data has fewer samples due to the window creation
+                # We need to align regimes with the actual training windows
+                train_regimes = regimes[self.window_size:len(regimes)-self.prediction_horizon]
+                if len(train_regimes) > len(X_train):
+                    train_regimes = train_regimes[:len(X_train)]
+                elif len(train_regimes) < len(X_train):
+                    # Pad with the most common regime if needed
+                    most_common_regime = np.bincount(train_regimes).argmax()
+                    train_regimes = np.pad(
+                        train_regimes, 
+                        (0, len(X_train) - len(train_regimes)),
+                        'constant', 
+                        constant_values=most_common_regime
+                    )
+                
+                np.save(os.path.join(processed_dir, "train_regimes.npy"), train_regimes)
+                logging.info(f"Saved {len(train_regimes)} regime labels for training data")
         
         logging.info("Data processing complete and saved.")
         

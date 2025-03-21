@@ -1,14 +1,45 @@
 import os
-import numpy as np
+import numpy as np  # Fixed syntax error: changed "import numpy np" to "import numpy as np"
 import pandas as pd
 import argparse
 import logging
 from datetime import datetime, timedelta
 
+# Import warning suppression utility first
+from src.utils.tf_warning_suppressor import suppress_tensorflow_warnings
+
 # Set matplotlib backend to 'Agg' for non-interactive use to avoid Tkinter errors
 import matplotlib
 matplotlib.use('Agg')  # Must be before importing pyplot
 import matplotlib.pyplot as plt
+
+# Configure GPU memory usage (if available)
+try:
+    import tensorflow as tf
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        # Prevent TensorFlow from allocating all GPU memory at once
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        logging.info(f"Found {len(gpus)} GPU(s)")
+        
+        # Use mixed precision policy for faster training on compatible GPUs
+        try:
+            from tensorflow.keras.mixed_precision import set_global_policy
+            set_global_policy('mixed_float16')
+            logging.info("Mixed precision training enabled")
+        except:
+            # Fall back to older TensorFlow versions
+            try:
+                from tensorflow.keras.mixed_precision import experimental as mixed_precision
+                policy = mixed_precision.Policy('mixed_float16')
+                mixed_precision.set_global_policy(policy)
+                logging.info("Mixed precision training enabled (legacy mode)")
+            except RuntimeError as e:
+                logging.warning(f"Mixed precision configuration error: {e}")
+                logging.warning("Running with default GPU configuration")
+except ImportError:
+    logging.warning("TensorFlow not imported correctly. Running in CPU mode.")
 
 # Import custom modules
 from src.data.data_loader import DataLoader
@@ -18,6 +49,7 @@ from src.agent.trading_agent import TradingAgent
 from src.evaluation.evaluator import ModelEvaluator
 from src.models.hyperparameter_tuner import HyperparameterTuner
 from src.visualization.metrics_visualizer import MetricsVisualizer
+from src.utils.performance_monitor import PerformanceMonitor
 
 # Configure logging
 logging.basicConfig(
@@ -87,7 +119,6 @@ def parse_arguments():
     
     parser.add_argument('--volatility-scaling', action='store_true',
                         help='Enable volatility-based stop-loss scaling')
-    
     # New arguments for sentiment analysis
     parser.add_argument('--use-sentiment', action='store_true', default=True,
                         help='Use news sentiment analysis in the model')
@@ -102,11 +133,55 @@ def parse_arguments():
     parser.add_argument('--num-iterations', type=int, default=10,
                        help='Number of previous training iterations to include in metrics visualization')
     
+    # Add new arguments for enhanced functionality
+    parser.add_argument('--use-ensemble', action='store_true',
+                        help='Use ensemble of models for better prediction stability')
+    
+    parser.add_argument('--ensemble-size', type=int, default=3,
+                        help='Number of models in the ensemble')
+    
+    parser.add_argument('--detect-regimes', action='store_true',
+                        help='Detect and use market regimes for predictions')
+    
+    parser.add_argument('--num-regimes', type=int, default=3,
+                        help='Number of market regimes to detect')
+    
+    parser.add_argument('--lookahead-test', action='store_true',
+                       help='Test for potential look-ahead bias in the model')
+    
+    parser.add_argument('--confidence-intervals', action='store_true',
+                       help='Generate and evaluate confidence intervals for predictions')
+    
+    parser.add_argument('--adaptive-horizon', action='store_true',
+                       help='Use adaptive prediction horizon based on market conditions')
+    
+    # Add new arguments for performance optimization
+    parser.add_argument('--batch-size', type=int, default=64,  # Increased from 32 to 64
+                        help='Batch size for model training')
+    parser.add_argument('--max-epochs', type=int, default=100,
+                        help='Maximum number of epochs for model training')
+    parser.add_argument('--patience', type=int, default=10,
+                        help='Patience for early stopping during training')
+    parser.add_argument('--intelligent-sampling', action='store_true',
+                        help='Enable intelligent data sampling for training')
+    parser.add_argument('--simplified-architecture', action='store_true',
+                        help='Use simplified model architecture for faster training')
+    parser.add_argument('--max-samples', type=int, default=5000,
+                        help='Maximum number of samples to use for training')
+    parser.add_argument('--reduced-features', action='store_true',
+                        help='Use reduced training data for faster iteration')
+    parser.add_argument('--feature-count', type=int, default=10,
+                        help='Number of features to use if feature reduction is enabled')
+    
     return parser.parse_args()
 
 def train_model(args):
     """Train the LSTM model"""
     logger.info("Starting model training process...")
+    
+    # Initialize performance monitor
+    perf_monitor = PerformanceMonitor()
+    perf_monitor.start_timer('total_execution')
     
     # Initialize metrics visualizer
     metrics_visualizer = MetricsVisualizer()
@@ -118,6 +193,9 @@ def train_model(args):
         logger.info(f"Previous RMSE: {previous_best_metrics['rmse']:.4f}, Direction Accuracy: {previous_best_metrics['direction_accuracy']:.4f}")
         if 'f1' in previous_best_metrics:
             logger.info(f"Previous F1: {previous_best_metrics['f1']:.4f}")
+    
+    # Monitor data loading
+    perf_monitor.start_timer('data_loading')
     
     # Load data with option to use complete history
     data_loader = DataLoader("TSLA", api_key=args.newsapi_key)
@@ -140,26 +218,40 @@ def train_model(args):
         logger.info(f"Fetching news data for sentiment analysis (past {args.sentiment_days} days)")
         data_loader.fetch_news_data(days_back=args.sentiment_days)
     
+    perf_monitor.stop_timer('data_loading')
+    
+    # Monitor preprocessing 
+    perf_monitor.start_timer('data_preprocessing')
+    
     # Debug the column structure before processing
     if isinstance(stock_data.columns, pd.MultiIndex):
         logger.info(f"Stock data has MultiIndex columns: {[col for col in stock_data.columns[:5]]}")
-        
         # If MultiIndex columns, normalize them first before preprocessing
         renamed_data = {}
         for name in ['Close', 'Open', 'High', 'Low', 'Volume']:
             col_matches = [col for col in stock_data.columns if name in col[0]]
             if col_matches:
                 renamed_data[name] = stock_data[col_matches[0]]
-        
         if renamed_data:
             logger.info("Standardizing MultiIndex columns to simple column names")
             stock_data = pd.DataFrame(renamed_data, index=stock_data.index)
     
-    # Preprocess data
-    preprocessor = Preprocessor(
-        window_size=args.window_size,
-        prediction_horizon=args.prediction_horizon
-    )
+    # Detect market regimes if requested
+    if args.detect_regimes:
+        logger.info(f"Detecting market regimes (n={args.num_regimes})...")
+        # Create preprocessor with regime detection
+        preprocessor = Preprocessor(
+            window_size=args.window_size,
+            prediction_horizon=args.prediction_horizon,
+            detect_regimes=True,
+            num_regimes=args.num_regimes
+        )
+    else:
+        # Standard preprocessor
+        preprocessor = Preprocessor(
+            window_size=args.window_size,
+            prediction_horizon=args.prediction_horizon
+        )
     
     try:
         X_train, X_test, y_train, y_test = preprocessor.prepare_data(stock_data)
@@ -174,6 +266,16 @@ def train_model(args):
         else:
             raise
     
+    perf_monitor.stop_timer('data_preprocessing')
+    
+    # Log data shape metrics
+    perf_monitor.record_metric('train_samples', len(X_train))
+    perf_monitor.record_metric('test_samples', len(X_test))
+    perf_monitor.record_metric('feature_count', X_train.shape[2])
+    perf_monitor.record_metric('window_size', args.window_size)
+    perf_monitor.record_metric('batch_size', args.batch_size)
+    perf_monitor.record_metric('max_epochs', args.max_epochs)
+    
     # Check for sentiment features
     sentiment_features = []
     try:
@@ -184,6 +286,45 @@ def train_model(args):
             logger.info(f"Loaded {len(sentiment_features)} sentiment features: {sentiment_features}")
     except Exception as e:
         logger.warning(f"Could not load sentiment features: {e}")
+    
+    # Check for lookahead bias if requested
+    if args.lookahead_test:
+        X_train_lookahead_test = X_train.copy()
+        y_train_lookahead_test = y_train.copy()
+        
+        # Create a small model for bias testing
+        test_model = LSTMModel(
+            window_size=args.window_size,
+            prediction_horizon=args.prediction_horizon,
+            feature_dim=X_train.shape[2]
+        )
+        test_model.build_model(lstm_units=64, dropout_rate=0.2)
+        
+        # Train for just a few epochs
+        test_model.train(
+            X_train_lookahead_test, y_train_lookahead_test,
+            X_val=X_test[:100], y_val=y_test[:100],  # Use subset for speed
+            epochs=10, batch_size=32
+        )
+        
+        # Test for lookahead bias
+        evaluator = ModelEvaluator()
+        bias_score = evaluator.detect_lookahead_bias(
+            test_model, X_train_lookahead_test, y_train_lookahead_test,
+            X_test, y_test, n_permutations=5
+        )
+        
+        logger.info(f"Lookahead bias test complete. Score: {bias_score:.4f}")
+        
+        # If bias score is high, warn the user
+        if (bias_score > 0.8):
+            logger.warning("WARNING: High risk of look-ahead bias detected in your data!")
+            logger.warning("This may cause optimistic performance estimates that won't generalize.")
+            logger.warning("Consider reviewing your feature engineering for time leakage.")
+            # Offer option to abort
+            if input("Would you like to continue training anyway? (y/n): ").lower() != 'y':
+                logger.info("Training aborted due to look-ahead bias concerns.")
+                return None, None, None, None
     
     # Hyperparameter tuning if requested
     if args.tune:
@@ -216,34 +357,85 @@ def train_model(args):
             model = best_model
             logger.info("Successfully created model with tuned hyperparameters")
     else:
-        # Create and train model with default architecture
-        feature_dim = X_train.shape[2]
-        model = LSTMModel(
-            window_size=args.window_size,
-            prediction_horizon=args.prediction_horizon,
-            feature_dim=feature_dim
-        )
-        
-        # After the model is created and before training, log the input shape and feature dimensions
-        if hasattr(model, 'model') and model.model is not None:
-            try:
-                model_input_shape = model.model.input_shape
-                if model_input_shape is not None:
-                    logger.info(f"Model input shape for training: {model_input_shape}, features: {X_train.shape[2]}")
-                    
-                    # Check for mismatch
-                    if model_input_shape[-1] != X_train.shape[2]:
-                        logger.warning(f"Feature dimension mismatch during training: model expects {model_input_shape[-1]} but data has {X_train.shape[2]}")
-            except Exception as e:
-                logger.warning(f"Could not determine model input shape during training: {e}")
-        
-        history = model.train(X_train, y_train, X_val=X_test, y_val=y_test, epochs=100)
+        # Create and train model with ensemble if requested
+        if args.use_ensemble:
+            feature_dim = X_train.shape[2]
+            model = LSTMModel(
+                window_size=args.window_size,
+                prediction_horizon=args.prediction_horizon,
+                feature_dim=feature_dim
+            )
+            logger.info(f"Training ensemble model with {args.ensemble_size} members")
+            # Train with ensemble
+            history = model.train(
+                X_train, y_train, 
+                X_val=X_test, y_val=y_test, 
+                epochs=100,
+                use_ensemble=True,
+                n_ensemble_models=args.ensemble_size
+            )
+        else:
+            # Create and train model with default architecture
+            feature_dim = X_train.shape[2]
+            model = LSTMModel(
+                window_size=args.window_size,
+                prediction_horizon=args.prediction_horizon,
+                feature_dim=feature_dim
+            )
+            # After the model is created and before training, log the input shape and feature dimensions
+            if hasattr(model, 'model') and model.model is not None:
+                try:
+                    model_input_shape = model.model.input_shape
+                    if model_input_shape is not None:
+                        logger.info(f"Model input shape for training: {model_input_shape}, features: {X_train.shape[2]}")
+                        # Check for mismatch
+                        if model_input_shape[-1] != X_train.shape[2]:
+                            logger.warning(f"Feature dimension mismatch during training: model expects {model_input_shape[-1]} but data has {X_train.shape[2]}")
+                except Exception as e:
+                    logger.warning(f"Could not determine model input shape during training: {e}")
+            
+            # Monitor training
+            perf_monitor.start_timer('model_training')
+            perf_monitor.log_memory_usage()
+            
+            history = model.train(X_train, y_train, X_val=X_test, y_val=y_test, epochs=100)
+            
+            perf_monitor.stop_timer('model_training')
+            perf_monitor.log_memory_usage()
+    
+    # Monitor evaluation
+    perf_monitor.start_timer('model_evaluation')
     
     # Evaluate model
     evaluator = ModelEvaluator()
-    predictions = model.predict(X_test)
+    
+    # Use confidence intervals if requested
+    if args.confidence_intervals:
+        # Get predictions with confidence intervals
+        predictions, confidence_intervals = model.predict(
+            X_test, 
+            use_ensemble=args.use_ensemble,
+            return_confidence=True
+        )
+        
+        # Plot predictions with confidence intervals
+        plot_predictions_with_confidence(
+            y_test, predictions, confidence_intervals,
+            preprocessor.price_scaler
+        )
+        
+        # Evaluate confidence intervals
+        ci_metrics = evaluator.evaluate_confidence_intervals(
+            y_test, predictions, confidence_intervals
+        )
+        # Add confidence interval metrics to main metrics
+        metrics.update(ci_metrics)
+    else:
+        predictions = model.predict(X_test, use_ensemble=args.use_ensemble)
     
     metrics = evaluator.evaluate_price_predictions(y_test, predictions, preprocessor.price_scaler)
+    
+    perf_monitor.stop_timer('model_evaluation')
     
     # Save metrics to history before comparing with previous best
     metrics_visualizer.save_metrics(metrics)
@@ -267,12 +459,7 @@ def train_model(args):
             if key in metrics and key in previous_best_metrics:
                 change = metrics[key] - previous_best_metrics[key]
                 change_symbol = "↑" if change > 0 else "↓" if change < 0 else "="
-                
-                # For error metrics (rmse, mae), lower is better
-                if key in ['rmse', 'mae']:
-                    improvement = "better" if change < 0 else "worse" if change > 0 else "same"
-                else:
-                    improvement = "better" if change > 0 else "worse" if change < 0 else "same"
+                improvement = "better" if change < 0 else "worse" if change > 0 else "same"
                 
                 print(f"{key.upper():<20} {previous_best_metrics[key]:.4f}      {metrics[key]:.4f}      {change:.4f} {change_symbol} ({improvement})")
         
@@ -281,6 +468,36 @@ def train_model(args):
         else:
             print("\n✗ Current model NOT saved (previous model is better)")
     
+    # Use market regime detection if requested
+    if args.detect_regimes and hasattr(model, 'market_regimes'):
+        # Check if we have detected regimes
+        if model.market_regimes and 'labels' in model.market_regimes:
+            regimes = model.market_regimes['labels']
+            
+            # Evaluate performance across different regimes
+            unique_regimes = np.unique(regimes)
+            
+            print("\nPerformance by Market Regime:")
+            print("-" * 50)
+            
+            for regime in unique_regimes:
+                # Get data points for this regime
+                regime_indices = np.where(regimes == regime)[0]
+                if len(regime_indices) > 10:  # Only evaluate if we have enough samples
+                    regime_X = X_test[regime_indices]
+                    regime_y = y_test[regime_indices]
+                    # Get predictions for this regime
+                    regime_predictions = model.predict(regime_X)
+                    # Calculate basic metrics for this regime
+                    regime_metrics = evaluator.evaluate_price_predictions(
+                        regime_y, regime_predictions, preprocessor.price_scaler
+                    )
+                    # Print regime-specific metrics
+                    print(f"Regime {regime} ({len(regime_indices)} samples):")
+                    print(f"  RMSE: {regime_metrics['rmse']:.4f}")
+                    print(f"  Direction Accuracy: {regime_metrics['direction_accuracy']:.4f}")
+                    print(f"  F1 Score: {regime_metrics['f1']:.4f}")
+                    
     return model, preprocessor, X_test, y_test
 
 def load_previous_metrics():
@@ -289,46 +506,62 @@ def load_previous_metrics():
     
     if os.path.exists(metrics_path):
         try:
-            with open(metrics_path, 'r') as f:
-                import json
-                return json.load(f)
+            # Import the JSON repair utility
+            from src.utils.json_repair import repair_json_file
+            
+            # Try to load and potentially repair the JSON file
+            success, data = repair_json_file(metrics_path)
+            if success and data:
+                logging.info("Successfully loaded previous metrics")
+                return data
+            else:
+                logging.warning("Could not load or repair metrics file")
+                return None
         except Exception as e:
-            logger.warning(f"Error loading previous metrics: {e}")
+            logging.error(f"Error loading previous metrics: {e}")
             return None
     else:
         return None
 
+def calculate_score(metrics):
+    """Calculate a composite score from metrics (higher is better)"""
+    score = 0
+    if 'rmse' in metrics:
+        score -= 0.3 * metrics['rmse']  # Lower RMSE is better
+    if 'direction_accuracy' in metrics:
+        score += 0.3 * metrics['direction_accuracy']  # Higher direction accuracy is better
+    if 'f1' in metrics:
+        score += 0.4 * metrics['f1']  # Higher F1 is better
+    return score
+
 def compare_and_save_metrics(current_metrics, previous_metrics):
-    """
-    Compare current metrics with previous best and save if better
-    Returns True if current metrics are better and were saved
-    """
-    # Define a scoring function (higher is better)
-    def calculate_score(metrics):
-        # Weighted sum of metrics (negative for error metrics since lower is better)
-        score = 0
-        if 'rmse' in metrics:
-            score -= 0.3 * metrics['rmse']  # Lower RMSE is better
-        if 'direction_accuracy' in metrics:
-            score += 0.3 * metrics['direction_accuracy']  # Higher direction accuracy is better
-        if 'f1' in metrics:
-            score += 0.4 * metrics['f1']  # Higher F1 is better
-        return score
-    
-    # Calculate scores
+    """Compare current metrics with previous best and save if better"""
     current_score = calculate_score(current_metrics)
     
     # If no previous metrics or current is better, save current as best
     if not previous_metrics or current_score > calculate_score(previous_metrics):
         metrics_path = os.path.join(os.path.dirname(__file__), "results", "best_model_metrics.json")
+        
         try:
             # Ensure results directory exists
             os.makedirs(os.path.dirname(metrics_path), exist_ok=True)
             
-            # Save metrics
+            # Convert NumPy types to Python native types before saving
+            serializable_metrics = {}
+            for key, value in current_metrics.items():
+                # Convert NumPy types to Python native types
+                if isinstance(value, (np.integer, np.floating)):
+                    serializable_metrics[key] = float(value)
+                elif isinstance(value, np.ndarray):
+                    serializable_metrics[key] = value.tolist()
+                else:
+                    serializable_metrics[key] = value
+            
+            # Save metrics using NumpyJSONEncoder
             with open(metrics_path, 'w') as f:
                 import json
-                json.dump(current_metrics, f, indent=2)
+                from src.visualization.metrics_visualizer import NumpyJSONEncoder
+                json.dump(serializable_metrics, f, indent=2, cls=NumpyJSONEncoder)
             
             logger.info(f"New best metrics saved with score: {current_score:.4f}")
             return True
@@ -343,11 +576,12 @@ def test_model(args, model=None, preprocessor=None):
     """Test the model on historical data"""
     logger.info("Starting model testing process...")
     
-    model_loaded = False
+    # Initialize data_loader at the beginning regardless of path
+    data_loader = DataLoader("TSLA", api_key=args.newsapi_key)
     
+    model_loaded = False
     if model is None or preprocessor is None:
         # Load data if not provided
-        data_loader = DataLoader("TSLA", api_key=args.newsapi_key)
         stock_data = data_loader.fetch_stock_data()
         
         # Fetch news data for sentiment if requested
@@ -369,7 +603,6 @@ def test_model(args, model=None, preprocessor=None):
                 prediction_horizon=args.prediction_horizon,
                 feature_dim=X_test.shape[2]
             )
-            
             if args.load_model:
                 model_loaded = model.load_saved_model(args.load_model)
             else:
@@ -382,9 +615,12 @@ def test_model(args, model=None, preprocessor=None):
             logger.error(f"Error preparing data or loading model: {e}")
             return None
     else:
+        # Even when model and preprocessor are provided, we still need stock_data for dates
+        stock_data = data_loader.fetch_stock_data()
+        
         # Get test data from preprocessor
+        processed_dir = os.path.join(os.path.dirname(__file__), "data", "processed")
         try:
-            processed_dir = os.path.join(os.path.dirname(__file__), "data", "processed")
             X_test = np.load(os.path.join(processed_dir, "X_test.npy"))
             y_test = np.load(os.path.join(processed_dir, "y_test.npy"))
             model_loaded = True
@@ -396,14 +632,13 @@ def test_model(args, model=None, preprocessor=None):
     if not model_loaded:
         logger.error("No valid model available for testing")
         return None
-        
-    # Create trading agent with stop-loss mechanism and new parameters
+    
+    # Run the agent with stop-loss mechanism and new parameters
     agent = TradingAgent(
         model=model,
         price_scaler=preprocessor.price_scaler,
         initial_capital=args.initial_capital,
         transaction_fee=args.transaction_fee / 100,  # Convert from percentage to decimal
-        risk_factor=args.risk_factor,
         stop_loss_pct=args.stop_loss,
         trailing_stop_pct=args.trailing_stop,
         max_trades_per_day=args.max_trades_per_day,
@@ -418,25 +653,23 @@ def test_model(args, model=None, preprocessor=None):
         agent.sentiment_influence = args.sentiment_weight
         logger.info(f"Using sentiment in trading decisions with weight: {args.sentiment_weight}")
     
+    # Load dates for test data
+    stock_data = data_loader.fetch_stock_data()
+    test_dates = stock_data.index[-len(X_test):]
+    
+    # Load sentiment data if available
+    sentiment_data = None
+    if args.use_sentiment:
+        try:
+            # Find all news sentiment columns in the stock data
+            sentiment_cols = [col for col in stock_data.columns if isinstance(col, str) and col.startswith('news_')]
+            if sentiment_cols:
+                sentiment_data = stock_data[sentiment_cols].copy()
+                logger.info(f"Loaded {len(sentiment_cols)} sentiment features for trading decisions")
+        except Exception as e:
+            logger.warning(f"Could not load sentiment data for trading: {e}")
+    
     try:
-        # Load dates for test data
-        data_loader = DataLoader("TSLA")
-        stock_data = data_loader.fetch_stock_data()
-        test_dates = stock_data.index[-len(X_test):]
-        
-        # Load sentiment data if available
-        sentiment_data = None
-        if args.use_sentiment:
-            try:
-                # Find all news sentiment columns in the stock data
-                sentiment_cols = [col for col in stock_data.columns if isinstance(col, str) and col.startswith('news_')]
-                if sentiment_cols:
-                    sentiment_data = stock_data[sentiment_cols].copy()
-                    logger.info(f"Loaded {len(sentiment_cols)} sentiment features for trading decisions")
-            except Exception as e:
-                logger.warning(f"Could not load sentiment data for trading: {e}")
-        
-        # Run simulation with sentiment data
         final_value, roi = agent.run_simulation(
             test_data=X_test,
             test_dates=test_dates,
@@ -456,7 +689,7 @@ def test_model(args, model=None, preprocessor=None):
             logger.info(f"Testing complete. Final portfolio value: ${final_value:.2f}, ROI: {roi:.2f}%")
         else:
             logger.warning("No transactions were executed during testing")
-            
+        
         return agent
     except Exception as e:
         logger.error(f"Error during testing simulation: {e}")
@@ -507,12 +740,11 @@ def trade(args):
         window_size=args.window_size,
         prediction_horizon=args.prediction_horizon
     )
-    
     if args.load_model:
         model_loaded = model.load_saved_model(args.load_model)
     else:
         model_loaded = model.load_saved_model()
-
+    
     if not model_loaded:
         logger.error("Failed to load model. Cannot proceed with trading.")
         return None
@@ -531,7 +763,7 @@ def trade(args):
         recent_window = X_train[-1:]  # Get the most recent window
         
         # Check if the feature dimensions match what the model expects
-        # Get model's input shape correctly from the model itself rather than individual layer
+        # Get model's input shape correctly from the model itself rather than individual layers
         if model.model is not None:
             # Get input shape from model's configuration
             try:
@@ -540,16 +772,13 @@ def trade(args):
                 if model_input_shape is not None:
                     model_feature_dim = model_input_shape[-1]
                     logger.info(f"Model input shape: {model_input_shape}, feature dimension: {model_feature_dim}")
-                    
                     # Adjust features if needed to match model's expectation
                     if recent_window.shape[2] != model_feature_dim:
                         logger.warning(f"Feature dimension mismatch: data has {recent_window.shape[2]} features, model expects {model_feature_dim}")
-                        
                         # If we have too many features, make an informed decision about which to truncate
                         if recent_window.shape[2] > model_feature_dim:
                             # Load feature names if available
                             feature_names = []
-                            priority_features = []
                             try:
                                 processed_dir = os.path.join(os.path.dirname(__file__), "data", "processed")
                                 feature_names_path = os.path.join(processed_dir, "feature_names.npy")
@@ -603,7 +832,6 @@ def trade(args):
                                 logger.warning(f"Could not load feature names: {e}")
                                 # Default truncation if something goes wrong
                                 recent_window = recent_window[:, :, :model_feature_dim]
-                            
                             logger.info(f"Final feature count after adjustment: {recent_window.shape[2]}")
                         # If we have too few features, we'd need to handle that case as well
                         elif recent_window.shape[2] < model_feature_dim:
@@ -616,11 +844,9 @@ def trade(args):
                     if model_input_shape is not None:
                         model_feature_dim = model_input_shape[-1]
                         logger.info(f"Model input shape from config: {model_input_shape}, feature dimension: {model_feature_dim}")
-                        
                         # Handle feature dimension mismatch
                         if recent_window.shape[2] != model_feature_dim:
                             logger.warning(f"Feature dimension mismatch: data has {recent_window.shape[2]} features, model expects {model_feature_dim}")
-                            
                             # If we have too many features, make an informed decision about which to truncate
                             if recent_window.shape[2] > model_feature_dim:
                                 # Load feature names if available
@@ -631,40 +857,47 @@ def trade(args):
                                     if os.path.exists(feature_names_path):
                                         feature_names = np.load(feature_names_path, allow_pickle=True)
                                         if len(feature_names) >= recent_window.shape[2]:
+                                            # Identify non-priority features to truncate
                                             truncated_features = feature_names[model_feature_dim:recent_window.shape[2]]
                                             logger.warning(f"Will truncate feature(s): {truncated_features}")
                                             logger.info(f"Last retained feature: {feature_names[model_feature_dim-1]}")
-                                    else:
-                                        logger.warning("Feature names file not found. Truncating features without feature identification.")
+                                            recent_window = recent_window[:, :, :model_feature_dim]
+                                        else:
+                                            logger.warning("Feature names file not found. Truncating features without feature identification.")
+                                            recent_window = recent_window[:, :, :model_feature_dim]
                                 except Exception as e:
                                     logger.warning(f"Could not load feature names: {e}")
-                                
-                                # Truncate to match model's expectation
-                                logger.info(f"Truncating features from {recent_window.shape[2]} to {model_feature_dim}")
-                                recent_window = recent_window[:, :, :model_feature_dim]
-                            # If we have too few features, we'd need to handle that case as well
-                            elif recent_window.shape[2] < model_feature_dim:
-                                logger.error(f"Data has fewer features than model expects: {recent_window.shape[2]} vs {model_feature_dim}")
-                                raise ValueError(f"Insufficient features: model expects {model_feature_dim} but data has {recent_window.shape[2]}")
+                                    # Default truncation if something goes wrong
+                                    recent_window = recent_window[:, :, :model_feature_dim]
+                            logger.info(f"Final feature count after adjustment: {recent_window.shape[2]}")
+                        # If we have too few features, we'd need to handle that case as well
+                        elif recent_window.shape[2] < model_feature_dim:
+                            logger.error(f"Data has fewer features than model expects: {recent_window.shape[2]} vs {model_feature_dim}")
+                            raise ValueError(f"Insufficient features: model expects {model_feature_dim} but data has {recent_window.shape[2]}")
                 except Exception as e:
                     logger.warning(f"Could not determine model input shape from config: {e}")
-                    # Just use the expected features from training data
                     logger.info(f"Using feature dimension from training data: {expected_feature_dim}")
+                    recent_window = recent_window[:, :, :expected_feature_dim]
+        else:
+            logger.warning("Model input shape not found. Using feature dimension from training data.")
+            recent_window = recent_window[:, :, :expected_feature_dim]
     except Exception as e:
-        logger.error(f"Error loading or processing training data: {e}")
+        logger.error(f"Error adjusting feature dimensions: {e}")
         return None
-
-    # Make prediction with error handling
+    
+    # Make predictions with error handling
     try:
-        # Make prediction for next 5 days
-        predictions = model.predict(recent_window)
+        predictions, confidence_intervals = model.predict(recent_window, return_confidence=True)
+        logger.info(f"Predicted prices for next {args.prediction_horizon} days: {predictions[0]}")
         
-        if predictions is None or np.isnan(predictions).any():
-            raise ValueError("Model prediction returned None or NaN values")
+        # Log confidence intervals
+        if args.confidence_intervals:
+            lower_bounds = confidence_intervals['lower_95'][0]
+            upper_bounds = confidence_intervals['upper_95'][0]
+            for i in range(len(predictions[0])):
+                logger.info(f"Day {i+1}: ${predictions[0][i]:.2f} (${lower_bounds[i]:.2f} - ${upper_bounds[i]:.2f})")
         
-        # Log raw predictions before scaling
-        logging.info(f"Raw model predictions: {predictions[0]}")
-        
+        # Scale predictions back to original prices
         if preprocessor.price_scaler is not None:
             try:
                 # Reshape for inverse transform
@@ -779,7 +1012,7 @@ def trade(args):
     
     for i in range(1, 8):  # Look ahead up to 7 calendar days to find 5 trading days
         next_day = today + timedelta(days=i)
-        if next_day.weekday() < 5:  # Monday to Friday (0-4)
+        if (next_day.weekday() < 5):  # Monday to Friday (0-4)
             next_days.append(next_day.strftime('%Y-%m-%d'))
             day_count += 1
             if day_count >= args.prediction_horizon:
@@ -814,6 +1047,36 @@ def trade(args):
     # Set sentiment influence if using sentiment
     if hasattr(trading_agent, 'sentiment_influence') and args.use_sentiment:
         trading_agent.sentiment_influence = args.sentiment_weight
+    
+    # Detect current market regime if requested
+    current_regime = None
+    regime_confidence = 0
+    if args.detect_regimes and hasattr(model, 'current_market_regime'):
+        try:
+            current_regime, regime_confidence = model.current_market_regime(recent_window)
+            if current_regime is not None:
+                logger.info(f"Detected current market regime: {current_regime} (confidence: {regime_confidence:.2f})")
+                
+                # Adjust prediction horizon based on regime if adaptive horizon is enabled
+                if args.adaptive_horizon and current_regime is not None:
+                    # For high volatility regimes, use shorter prediction horizon
+                    # For low volatility regimes, can use longer horizon
+                    if current_regime == 0:  # Assuming 0 is high volatility regime
+                        effective_horizon = min(3, args.prediction_horizon)
+                        logger.info(f"High volatility regime detected - using shorter horizon ({effective_horizon} days)")
+                    elif current_regime == 1:  # Assuming 1 is medium volatility
+                        effective_horizon = args.prediction_horizon
+                        logger.info(f"Medium volatility regime - using standard horizon ({effective_horizon} days)")
+                    else:  # Low volatility regime
+                        effective_horizon = args.prediction_horizon
+                        logger.info(f"Low volatility regime - using standard horizon ({effective_horizon} days)")
+                        
+                    # Truncate predictions to effective horizon
+                    pred_prices = predictions[0][:effective_horizon]
+                    next_days = next_days[:effective_horizon]
+                    logger.info(f"Adjusted prediction horizon to {effective_horizon} days based on current market regime")
+        except Exception as e:
+            logger.warning(f"Error detecting market regime: {e}")
     
     # Calculate min/max price days BEFORE the recommendation loop
     pred_prices = predictions[0]
@@ -958,7 +1221,7 @@ def trade(args):
     os.makedirs(results_dir, exist_ok=True)
     rec_df.to_csv(os.path.join(results_dir, f'recommendations_{datetime.now().strftime("%Y%m%d")}.csv'), index=False)
     
-    # Visualize predictions with sentiment adjustment
+    # Visualize predictions with confidence intervals if available
     plt.figure(figsize=(10, 6))
     
     # Plot historical data (last 30 days)
@@ -973,15 +1236,20 @@ def trade(args):
     plt.plot(range(len(hist_dates), len(hist_dates) + len(pred_prices)), 
              pred_prices, 'r--', label='Predicted')
     
-    # Plot sentiment-adjusted predictions if sentiment is available
-    if current_sentiment and args.use_sentiment:
-        adjusted_prices = pred_prices.copy()
-        for i in range(len(adjusted_prices)):
-            sentiment_adj = recommendations[i]['sentiment_adjustment'] / 100 * current_price
-            adjusted_prices[i] += sentiment_adj
-            
-        plt.plot(range(len(hist_dates), len(hist_dates) + len(adjusted_prices)),
-                 adjusted_prices, 'g:', label='Sentiment Adjusted')
+    # Plot confidence intervals if available
+    if args.confidence_intervals and 'confidence_intervals' in locals():
+        lower_bounds = confidence_intervals['lower_95'][0]
+        upper_bounds = confidence_intervals['upper_95'][0]
+        
+        x_range = range(len(hist_dates), len(hist_dates) + len(pred_prices))
+        plt.fill_between(
+            x_range, 
+            lower_bounds, 
+            upper_bounds, 
+            color='gray', 
+            alpha=0.3, 
+            label='95% Confidence'
+        )
     
     # Highlight optimal buy/sell points
     if min_price_day < max_price_day:
@@ -992,7 +1260,7 @@ def trade(args):
     all_dates = np.concatenate([hist_dates.strftime('%Y-%m-%d').values if hist_dates is not None else [], next_days])
     plt.xticks(range(0, len(all_dates), 5), all_dates[::5], rotation=45)
     
-    plt.title('Tesla Stock Price Prediction')
+    plt.title('Tesla Stock Price Prediction with Confidence Intervals')
     plt.xlabel('Date')
     plt.ylabel('Price ($)')
     plt.legend()
@@ -1005,6 +1273,104 @@ def trade(args):
     plt.close()
     
     return rec_df
+
+def plot_predictions_with_confidence(actual, predicted, confidence_intervals, scaler=None):
+    """Plot predictions with confidence intervals"""
+    if confidence_intervals is None:
+        return
+        
+    # Transform data if scaler is provided
+    if scaler:
+        # Reshape for inverse transform if necessary
+        if len(actual.shape) > 1:
+            actual_reshaped = actual.reshape(-1, actual.shape[-1])
+            predicted_reshaped = predicted.reshape(-1, predicted.shape[-1])
+            lower_reshaped = confidence_intervals['lower_95'].reshape(-1, confidence_intervals['lower_95'].shape[-1])
+            upper_reshaped = confidence_intervals['upper_95'].reshape(-1, confidence_intervals['upper_95'].shape[-1])
+        else:
+            actual_reshaped = actual.reshape(-1, 1)
+            predicted_reshaped = predicted.reshape(-1, 1)
+            lower_reshaped = confidence_intervals['lower_95'].reshape(-1, 1)
+            upper_reshaped = confidence_intervals['upper_95'].reshape(-1, 1)
+            
+        # Transform back to original scale
+        actual_orig = scaler.inverse_transform(actual_reshaped)
+        predicted_orig = scaler.inverse_transform(predicted_reshaped)
+        lower_orig = scaler.inverse_transform(lower_reshaped)
+        upper_orig = scaler.inverse_transform(upper_reshaped)
+        
+        # Reshape back if necessary
+        if len(actual.shape) > 1:
+            actual_values = actual_orig.reshape(actual.shape)
+            predicted_values = predicted_orig.reshape(predicted.shape)
+            lower_bounds = lower_orig.reshape(confidence_intervals['lower_95'].shape)
+            upper_bounds = upper_orig.reshape(confidence_intervals['upper_95'].shape)
+        else:
+            actual_values = actual_orig.flatten()
+            predicted_values = predicted_orig.flatten()
+            lower_bounds = lower_orig.flatten()
+            upper_bounds = upper_orig.flatten()
+    else:
+        actual_values = actual
+        predicted_values = predicted
+        lower_bounds = confidence_intervals['lower_95']
+        upper_bounds = confidence_intervals['upper_95']
+    
+    # Create the plot
+    plt.figure(figsize=(14, 7))
+    
+    # Plot for first day prediction with confidence intervals
+    plt.subplot(1, 2, 1)
+    x = np.arange(len(actual_values))
+    plt.plot(x, actual_values[:, 0], 'b-', label='Actual', linewidth=2)
+    plt.plot(x, predicted_values[:, 0], 'r--', label='Predicted', linewidth=2)
+    
+    # Add confidence intervals shading
+    plt.fill_between(
+        x, 
+        lower_bounds[:, 0], 
+        upper_bounds[:, 0], 
+        color='red', 
+        alpha=0.2, 
+        label='95% Confidence'
+    )
+    
+    plt.title('1-Day Ahead Predictions')
+    plt.xlabel('Time')
+    plt.ylabel('Price')
+    plt.legend()
+    plt.grid(True)
+    
+    # Plot for last day prediction with confidence intervals
+    plt.subplot(1, 2, 2)
+    plt.plot(x, actual_values[:, -1], 'b-', label='Actual', linewidth=2)
+    plt.plot(x, predicted_values[:, -1], 'r--', label='Predicted', linewidth=2)
+    
+    # Add confidence intervals shading
+    plt.fill_between(
+        x, 
+        lower_bounds[:, -1], 
+        upper_bounds[:, -1], 
+        color='red', 
+        alpha=0.2, 
+        label='95% Confidence'
+    )
+    
+    plt.title(f'{actual_values.shape[1]}-Day Ahead Predictions')
+    plt.xlabel('Time')
+    plt.ylabel('Price')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
+    
+    # Save the figure
+    plt.savefig(os.path.join(
+        os.path.dirname(__file__), 
+        "results", 
+        f'predictions_with_confidence_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png'
+    ))
+    plt.close()
 
 def main():
     """Main execution function"""

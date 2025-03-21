@@ -3,62 +3,117 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import LSTM, Dense, Dropout, BatchNormalization, Input
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.regularizers import l1_l2
 import logging
 import matplotlib.pyplot as plt
 from datetime import datetime
+import joblib
+from sklearn.cluster import KMeans
+from sklearn.ensemble import RandomForestRegressor
+from scipy.stats import norm
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class LSTMModel:
-    def __init__(self, window_size=30, prediction_horizon=5, feature_dim=1):
-        """Initialize the LSTM model"""
+    def __init__(self, window_size=30, prediction_horizon=5, feature_dim=1, simplified=False):
+        """
+        Initialize the LSTM model
+        
+        Args:
+            window_size: Size of the sliding window for input data
+            prediction_horizon: Number of days to predict ahead
+            feature_dim: Number of features per time step
+            simplified: Whether to use simplified architecture for faster training
+        """
         self.window_size = window_size
         self.prediction_horizon = prediction_horizon
         self.feature_dim = feature_dim
         self.model = None
+        self.ensemble_models = []  # Store multiple models for ensemble predictions
         self.models_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "models")
+        self.market_regimes = {}  # Store detected market regimes
+        self.simplified = simplified  # Flag for simplified architecture
         os.makedirs(self.models_dir, exist_ok=True)
         
-    def build_model(self, lstm_units=128, dropout_rate=0.2, learning_rate=0.001):
+    def build_model(self, lstm_units=128, dropout_rate=0.2, learning_rate=0.001, regularization_factor=0.01):
         """
-        Build LSTM model architecture with improved design
+        Build LSTM model architecture with improved regularization and design
         
         Args:
             lstm_units: Number of LSTM units in each layer
             dropout_rate: Dropout rate for regularization
             learning_rate: Learning rate for Adam optimizer
+            regularization_factor: L1/L2 regularization strength
         """
-        # Use TF's recommended method to clear session instead of deprecated reset_default_graph
+        # Use the TensorFlow 2.x recommended method to clear session
         tf.keras.backend.clear_session()
         
+        # Add regularizers to prevent overfitting
+        regularizer = l1_l2(l1=regularization_factor/2, l2=regularization_factor)
+        
         # Create Sequential model with proper input specification
-        model = Sequential([
-            # Input layer with explicit shape
-            Input(shape=(self.window_size, self.feature_dim), name='input_layer'),
+        if self.simplified:
+            # Simplified architecture for faster training
+            logging.info("Using simplified model architecture for faster training")
             
-            # First LSTM layer with return sequences for stacking
-            LSTM(
-                units=lstm_units,
-                return_sequences=True,
-                name='lstm_1'
-            ),
-            BatchNormalization(name='batch_norm_1'),
-            Dropout(dropout_rate, name='dropout_1'),
+            # Reduce units and layers
+            simplified_units = lstm_units // 2  # Half the units
             
-            # Second LSTM layer
-            LSTM(units=int(lstm_units/2), return_sequences=False, name='lstm_2'),
-            BatchNormalization(name='batch_norm_2'),
-            Dropout(dropout_rate, name='dropout_2'),
-            
-            # Dense hidden layer for additional pattern recognition
-            Dense(units=64, activation='relu', name='dense_1'),
-            Dropout(dropout_rate/2, name='dropout_3'),
-            
-            # Output layer (predicting multiple days ahead)
-            Dense(units=self.prediction_horizon, name='output')
-        ])
+            model = Sequential([
+                # Input layer with explicit shape
+                Input(shape=(self.window_size, self.feature_dim), name='input_layer'),
+                
+                # Single LSTM layer
+                LSTM(
+                    units=simplified_units,
+                    return_sequences=False,  # No stacked LSTM
+                    kernel_regularizer=regularizer,
+                    name='lstm_1'
+                ),
+                BatchNormalization(name='batch_norm_1'),
+                Dropout(dropout_rate, name='dropout_1'),
+                
+                # Output layer (predicting multiple days ahead)
+                Dense(units=self.prediction_horizon, name='output')
+            ])
+        else:
+            # Standard model architecture
+            model = Sequential([
+                # Input layer with explicit shape
+                Input(shape=(self.window_size, self.feature_dim), name='input_layer'),
+                
+                # First LSTM layer with return sequences for stacking
+                LSTM(
+                    units=lstm_units,
+                    return_sequences=True,
+                    kernel_regularizer=regularizer,
+                    recurrent_regularizer=regularizer,
+                    name='lstm_1'
+                ),
+                BatchNormalization(name='batch_norm_1'),
+                Dropout(dropout_rate, name='dropout_1'),
+                
+                # Second LSTM layer with regularization
+                LSTM(units=int(lstm_units/2), 
+                     return_sequences=False, 
+                     kernel_regularizer=regularizer,
+                     recurrent_regularizer=regularizer,
+                     name='lstm_2'),
+                BatchNormalization(name='batch_norm_2'),
+                Dropout(dropout_rate, name='dropout_2'),
+                
+                # Dense hidden layer for additional pattern recognition
+                Dense(units=64, 
+                      activation='relu', 
+                      kernel_regularizer=regularizer,
+                      name='dense_1'),
+                Dropout(dropout_rate/2, name='dropout_3'),
+                
+                # Output layer (predicting multiple days ahead)
+                Dense(units=self.prediction_horizon, name='output')
+            ])
         
         # Compile model with Adam optimizer and MSE loss
         model.compile(
@@ -67,15 +122,140 @@ class LSTMModel:
             metrics=['mae', 'mape']
         )
         
-        logging.info(f"LSTM model built with {lstm_units} units, {dropout_rate} dropout rate")
+        # Log model configuration
+        if self.simplified:
+            logging.info(f"Simplified LSTM model built with {simplified_units} units")
+        else:
+            logging.info(f"LSTM model built with {lstm_units} units, {dropout_rate} dropout rate, {regularization_factor} regularization")
+        
         logging.info(f"Model summary: {model.summary()}")
+        
         self.model = model
         return model
-    
-    def train(self, X_train, y_train, X_val=None, y_val=None, epochs=100, batch_size=32,
-              patience=20, lstm_units=128, dropout_rate=0.2, learning_rate=0.001):
+        
+    def detect_market_regime(self, X, y=None, n_regimes=3):
         """
-        Train the LSTM model with improved training process
+        Detect market regimes using unsupervised clustering
+        
+        Args:
+            X: Input features (can be windowed data or raw features)
+            y: Optional target values
+            n_regimes: Number of regimes to detect
+            
+        Returns:
+            Regime labels and centroids
+        """
+        logging.info(f"Detecting market regimes with {n_regimes} clusters")
+        
+        # Use the last value of each window, or flatten data if needed
+        if len(X.shape) == 3:  # Windowed data
+            # Extract relevant features for regime detection (e.g., volatility, volume, price movement)
+            # For simplicity, we'll use the last timestep of each window
+            features_for_clustering = X[:, -1, :]
+        else:
+            features_for_clustering = X
+            
+        # Normalize data for clustering
+        from sklearn.preprocessing import StandardScaler
+        scaler = StandardScaler()
+        normalized_features = scaler.fit_transform(features_for_clustering)
+        
+        # Apply KMeans clustering to identify regimes
+        kmeans = KMeans(n_clusters=n_regimes, random_state=42)
+        regimes = kmeans.fit_predict(normalized_features)
+        
+        # Save regime model and scaler
+        regime_models_dir = os.path.join(self.models_dir, 'regime_models')
+        os.makedirs(regime_models_dir, exist_ok=True)
+        
+        joblib.dump(kmeans, os.path.join(regime_models_dir, 'kmeans_regimes.joblib'))
+        joblib.dump(scaler, os.path.join(regime_models_dir, 'regime_scaler.joblib'))
+        
+        # Store regime information
+        self.market_regimes = {
+            'kmeans': kmeans,
+            'scaler': scaler,
+            'centroids': kmeans.cluster_centers_,
+            'labels': regimes
+        }
+        
+        # Log regime distribution
+        regime_counts = np.bincount(regimes)
+        regime_percentages = regime_counts / len(regimes) * 100
+        
+        logging.info(f"Market regime distribution:")
+        for i, (count, percentage) in enumerate(zip(regime_counts, regime_percentages)):
+            logging.info(f"Regime {i}: {count} samples ({percentage:.1f}%)")
+            
+        return regimes, kmeans.cluster_centers_
+    
+    def build_ensemble_models(self, n_models=3, **kwargs):
+        """
+        Build multiple models with different configurations for ensemble predictions
+        
+        Args:
+            n_models: Number of models in the ensemble
+            **kwargs: Parameters for model building
+        """
+        logging.info(f"Building ensemble with {n_models} models")
+        
+        self.ensemble_models = []
+        
+        # Define variations for different models
+        lstm_units_options = [64, 96, 128, 160]
+        dropout_options = [0.2, 0.3, 0.4]
+        learning_rate_options = [0.001, 0.0005, 0.0003]
+        regularization_options = [0.01, 0.005, 0.02]
+        
+        for i in range(n_models):
+            # Pick different hyperparameters for each model
+            lstm_units = np.random.choice(lstm_units_options)
+            dropout_rate = np.random.choice(dropout_options)
+            learning_rate = np.random.choice(learning_rate_options)
+            regularization = np.random.choice(regularization_options)
+            
+            # Build model with different configuration
+            model = Sequential([
+                Input(shape=(self.window_size, self.feature_dim)),
+                LSTM(
+                    units=lstm_units,
+                    return_sequences=True,
+                    kernel_regularizer=l1_l2(l1=regularization/2, l2=regularization)
+                ),
+                BatchNormalization(),
+                Dropout(dropout_rate),
+                LSTM(units=int(lstm_units/2), 
+                     kernel_regularizer=l1_l2(l1=regularization/2, l2=regularization)),
+                BatchNormalization(),
+                Dropout(dropout_rate),
+                Dense(units=self.prediction_horizon)
+            ])
+            
+            model.compile(
+                optimizer=Adam(learning_rate=learning_rate),
+                loss='mse',
+                metrics=['mae']
+            )
+            
+            self.ensemble_models.append({
+                'model': model,
+                'config': {
+                    'lstm_units': lstm_units,
+                    'dropout_rate': dropout_rate,
+                    'learning_rate': learning_rate,
+                    'regularization': regularization
+                }
+            })
+            
+            logging.info(f"Ensemble model {i+1} built with units={lstm_units}, dropout={dropout_rate}")
+            
+        return self.ensemble_models
+
+    def train(self, X_train, y_train, X_val=None, y_val=None, epochs=100, batch_size=64,
+              patience=10, lstm_units=128, dropout_rate=0.2, learning_rate=0.001,
+              use_ensemble=False, n_ensemble_models=3):
+        """
+        Train the LSTM model with improved training process and ensemble option
         
         Args:
             X_train: Training data
@@ -88,11 +268,86 @@ class LSTMModel:
             lstm_units: Number of LSTM units
             dropout_rate: Dropout rate for regularization
             learning_rate: Learning rate for optimizer
+            use_ensemble: Whether to use ensemble models
+            n_ensemble_models: Number of models in ensemble
             
         Returns:
             Training history
         """
-        # Build model if not already built
+        # Log training configuration
+        logging.info(f"Training configuration: epochs={epochs}, batch_size={batch_size}, patience={patience}")
+        logging.info(f"Training data shape: X={X_train.shape}, y={y_train.shape}")
+        if X_val is not None:
+            logging.info(f"Validation data shape: X={X_val.shape}, y={y_val.shape}")
+        
+        # Detect market regimes if we have enough data
+        if len(X_train) > 100:
+            self.detect_market_regime(X_train)
+            
+        # Build ensemble models if requested
+        if use_ensemble:
+            self.build_ensemble_models(n_models=n_ensemble_models, 
+                                       lstm_units=lstm_units,
+                                       dropout_rate=dropout_rate, 
+                                       learning_rate=learning_rate)
+            
+            # Train each model in the ensemble
+            ensemble_histories = []
+            for i, model_info in enumerate(self.ensemble_models):
+                model = model_info['model']
+                logging.info(f"Training ensemble model {i+1}/{len(self.ensemble_models)}")
+                
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                checkpoint_path = os.path.join(self.models_dir, f'ensemble_{i+1}_checkpoint_{timestamp}.keras')
+                
+                callbacks = [
+                    EarlyStopping(
+                        monitor='val_loss' if X_val is not None else 'loss',
+                        patience=patience,
+                        restore_best_weights=True,
+                        mode='min',
+                        verbose=1
+                    ),
+                    ModelCheckpoint(
+                        filepath=checkpoint_path,
+                        monitor='val_loss' if X_val is not None else 'loss',
+                        save_best_only=True,
+                        mode='min',
+                        verbose=1
+                    )
+                ]
+                
+                # Train with or without validation data
+                if X_val is not None and y_val is not None:
+                    history = model.fit(
+                        X_train, y_train,
+                        validation_data=(X_val, y_val),
+                        epochs=epochs,
+                        batch_size=batch_size,
+                        callbacks=callbacks,
+                        verbose=1
+                    )
+                else:
+                    history = model.fit(
+                        X_train, y_train,
+                        epochs=epochs,
+                        batch_size=batch_size,
+                        callbacks=callbacks,
+                        verbose=1
+                    )
+                
+                # Save model
+                model_path = os.path.join(self.models_dir, f'ensemble_{i+1}_{timestamp}.keras')
+                model.save(model_path)
+                logging.info(f"Ensemble model {i+1} saved to {model_path}")
+                
+                ensemble_histories.append(history.history)
+            
+            # Set the first model as the main model for compatibility
+            self.model = self.ensemble_models[0]['model']
+            return ensemble_histories
+            
+        # Build single model if not already built
         if self.model is None:
             self.build_model(lstm_units, dropout_rate, learning_rate)
             
@@ -120,18 +375,17 @@ class LSTMModel:
                 save_best_only=True,
                 mode='min',
                 verbose=1
+            ),
+            
+            # Learning rate scheduler for better convergence
+            ReduceLROnPlateau(
+                monitor='val_loss' if X_val is not None else 'loss',
+                factor=0.5,
+                patience=patience//2,
+                min_lr=0.00001,
+                verbose=1
             )
         ]
-        
-        # Add learning rate scheduler to improve convergence
-        lr_scheduler = tf.keras.callbacks.ReduceLROnPlateau(
-            monitor='val_loss' if X_val is not None else 'loss', 
-            factor=0.5, 
-            patience=patience//2,
-            min_lr=0.00001,
-            verbose=1
-        )
-        callbacks.append(lr_scheduler)
         
         # Training with or without validation data
         if X_val is not None and y_val is not None:
@@ -142,7 +396,7 @@ class LSTMModel:
                 epochs=epochs,
                 batch_size=batch_size,
                 callbacks=callbacks,
-                verbose=2
+                verbose=1  # Changed from 2 to 1 for more informative progress bars
             )
         else:
             logging.info(f"Starting model training without validation for {epochs} epochs")
@@ -151,7 +405,7 @@ class LSTMModel:
                 epochs=epochs,
                 batch_size=batch_size,
                 callbacks=callbacks,
-                verbose=2
+                verbose=1
             )
         
         # Save the final model with timestamp
@@ -244,15 +498,17 @@ class LSTMModel:
         except Exception as e:
             logging.warning(f"Error while cleaning up old files: {e}")
         
-    def predict(self, X):
+    def predict(self, X, use_ensemble=False, return_confidence=False):
         """
-        Make predictions using trained model
+        Make predictions using trained model with confidence intervals
         
         Args:
             X: Input data to predict on
+            use_ensemble: Whether to use ensemble models for prediction
+            return_confidence: Whether to return confidence intervals
             
         Returns:
-            Predictions
+            Predictions and optional confidence intervals
         """
         if self.model is None:
             logging.warning("Model not trained yet. Loading default model...")
@@ -263,7 +519,7 @@ class LSTMModel:
             return None
             
         try:
-            # Check input dimensions using the model config instead of direct attribute access
+            # Existing feature dimension handling code
             expected_feature_dim = None
             try:
                 # Method 1: Try to get input shape from model's first layer config
@@ -310,30 +566,141 @@ class LSTMModel:
                     X = np.concatenate([X, padding], axis=2)
             
             # Make prediction and perform basic validation
-            predictions = self.model.predict(X)
-            
-            if predictions is None:
-                logging.error("Model returned None predictions")
-                return None
+            if use_ensemble and self.ensemble_models:
+                # Predict with each model in the ensemble
+                ensemble_predictions = []
+                for model_info in self.ensemble_models:
+                    model = model_info['model']
+                    if model is not None:
+                        try:
+                            pred = model.predict(X)
+                            ensemble_predictions.append(pred)
+                        except Exception as e:
+                            logging.warning(f"Ensemble model prediction failed: {e}")
                 
-            if np.isnan(predictions).any():
-                logging.error(f"Model returned NaN predictions: {np.sum(np.isnan(predictions))} NaN values")
-                # Try to replace NaNs with meaningful values (e.g., mean of non-NaN predictions)
-                if not np.isnan(predictions).all():
-                    non_nan_mean = np.nanmean(predictions)
-                    predictions = np.nan_to_num(predictions, nan=non_nan_mean)
-                    logging.info(f"Replaced NaN values with mean: {non_nan_mean}")
+                if not ensemble_predictions:
+                    logging.warning("All ensemble models failed, falling back to primary model")
+                    predictions = self.model.predict(X)
                 else:
-                    return None
+                    # Average the predictions with outlier handling
+                    ensemble_predictions = np.array(ensemble_predictions)
                     
-            # Additional validation - ensure predictions aren't all identical values
-            if np.allclose(predictions[0], predictions[0][0]):
-                logging.warning("All prediction values are identical - model may not be functioning properly")
+                    # For each time step and each day in the prediction horizon
+                    # Compute mean and standard deviation, excluding outliers
+                    mean_predictions = np.zeros((ensemble_predictions.shape[1], ensemble_predictions.shape[2]))
+                    std_predictions = np.zeros((ensemble_predictions.shape[1], ensemble_predictions.shape[2]))
                     
+                    for i in range(ensemble_predictions.shape[1]):  # For each sample
+                        for j in range(ensemble_predictions.shape[2]):  # For each day in prediction
+                            # Get all model predictions for this sample and day
+                            predictions_ij = ensemble_predictions[:, i, j]
+                            
+                            # Exclude outliers (predictions outside 1.5 IQR)
+                            q1, q3 = np.percentile(predictions_ij, [25, 75])
+                            iqr = q3 - q1
+                            lower_bound = q1 - 1.5 * iqr
+                            upper_bound = q3 + 1.5 * iqr
+                            
+                            # Filter outliers
+                            filtered_preds = predictions_ij[(predictions_ij >= lower_bound) & (predictions_ij <= upper_bound)]
+                            
+                            # Use filtered predictions if we have enough, otherwise use all
+                            if len(filtered_preds) > len(predictions_ij) / 2:
+                                mean_predictions[i, j] = np.mean(filtered_preds)
+                                std_predictions[i, j] = np.std(filtered_preds)
+                            else:
+                                mean_predictions[i, j] = np.mean(predictions_ij)
+                                std_predictions[i, j] = np.std(predictions_ij)
+                    
+                    predictions = mean_predictions.reshape(ensemble_predictions.shape[1:])
+                    
+                    if return_confidence:
+                        # Create 95% confidence intervals based on ensemble predictions
+                        lower_bound = mean_predictions - 1.96 * std_predictions
+                        upper_bound = mean_predictions + 1.96 * std_predictions
+                        
+                        confidence_intervals = {
+                            'mean': mean_predictions,
+                            'std': std_predictions,
+                            'lower_95': lower_bound.reshape(ensemble_predictions.shape[1:]),
+                            'upper_95': upper_bound.reshape(ensemble_predictions.shape[1:])
+                        }
+                        
+                        return predictions, confidence_intervals
+            else:
+                predictions = self.model.predict(X)
+                
+                if return_confidence:
+                    # For single model, estimate uncertainty based on prediction horizon
+                    std_predictions = np.zeros_like(predictions)
+                    # Start with 5% uncertainty, increasing with prediction horizon
+                    for i in range(predictions.shape[1]):
+                        # Increase uncertainty for longer-term predictions
+                        uncertainty = 0.05 + (i * 0.03)  # 5% base, +3% per day
+                        std_predictions[:, i] = np.abs(predictions[:, i]) * uncertainty
+                    
+                    lower_bound = predictions - 1.96 * std_predictions
+                    upper_bound = predictions + 1.96 * std_predictions
+                    
+                    confidence_intervals = {
+                        'mean': predictions,
+                        'std': std_predictions,
+                        'lower_95': lower_bound,
+                        'upper_95': upper_bound
+                    }
+                    
+                    return predictions, confidence_intervals
+            
+            if return_confidence:
+                # Default return format if we didn't hit a special case above
+                return predictions, None
+                
             return predictions
+            
         except Exception as e:
             logging.error(f"Error during prediction: {e}")
             return None
+            
+    def current_market_regime(self, recent_data):
+        """
+        Identify the current market regime based on recent data
+        
+        Args:
+            recent_data: Recent market data
+            
+        Returns:
+            Regime label and confidence
+        """
+        if not self.market_regimes or 'kmeans' not in self.market_regimes:
+            logging.warning("No market regimes detected yet")
+            return None, 0
+            
+        try:
+            # Prepare data for regime detection
+            if len(recent_data.shape) == 3:  # Windowed data
+                features = recent_data[:, -1, :]  # Use last timestep
+            else:
+                features = recent_data
+                
+            # Scale features
+            scaler = self.market_regimes['scaler']
+            scaled_features = scaler.transform(features)
+            
+            # Predict regime
+            kmeans = self.market_regimes['kmeans']
+            regime = kmeans.predict(scaled_features)[0]
+            
+            # Calculate confidence as inverse of distance to centroid
+            centroid = kmeans.cluster_centers_[regime]
+            distance = np.linalg.norm(scaled_features[0] - centroid)
+            max_distance = np.max([np.linalg.norm(c - centroid) for c in kmeans.cluster_centers_])
+            confidence = 1 - (distance / max_distance)
+            
+            return regime, confidence
+            
+        except Exception as e:
+            logging.error(f"Error detecting market regime: {e}")
+            return None, 0
     
     def load_saved_model(self, model_path=None):
         """

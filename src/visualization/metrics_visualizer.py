@@ -6,6 +6,17 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 import logging
 
+class NumpyJSONEncoder(json.JSONEncoder):
+    """JSON encoder that handles NumPy data types"""
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super(NumpyJSONEncoder, self).default(obj)
+
 class MetricsVisualizer:
     def __init__(self, results_dir=None):
         """
@@ -30,6 +41,17 @@ class MetricsVisualizer:
             metrics: Dictionary containing metrics
             iteration: Custom iteration number (optional)
         """
+        # Ensure metrics contains only JSON-serializable values
+        serializable_metrics = {}
+        for key, value in metrics.items():
+            # Convert NumPy types to Python native types
+            if isinstance(value, (np.integer, np.floating)):
+                serializable_metrics[key] = float(value)
+            elif isinstance(value, np.ndarray):
+                serializable_metrics[key] = value.tolist()
+            else:
+                serializable_metrics[key] = value
+        
         # Load existing metrics history
         history = self.load_metrics_history()
         
@@ -44,7 +66,7 @@ class MetricsVisualizer:
         entry = {
             "iteration": iteration,
             "timestamp": timestamp,
-            "metrics": metrics
+            "metrics": serializable_metrics
         }
         
         history.append(entry)
@@ -52,7 +74,7 @@ class MetricsVisualizer:
         # Save updated history
         try:
             with open(self.metrics_history_file, 'w') as f:
-                json.dump(history, f, indent=2)
+                json.dump(history, f, indent=2, cls=NumpyJSONEncoder)
             logging.info(f"Metrics saved to {self.metrics_history_file}")
         except Exception as e:
             logging.error(f"Error saving metrics history: {e}")
@@ -70,6 +92,13 @@ class MetricsVisualizer:
                     return json.load(f)
             except Exception as e:
                 logging.error(f"Error loading metrics history: {e}")
+                # If the file is corrupt, rename it and create a new one
+                try:
+                    backup_file = f"{self.metrics_history_file}.bak.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    os.rename(self.metrics_history_file, backup_file)
+                    logging.warning(f"Renamed corrupt metrics history file to {backup_file}")
+                except Exception as rename_error:
+                    logging.error(f"Could not rename corrupt file: {rename_error}")
                 return []
         return []
         
@@ -118,7 +147,8 @@ class MetricsVisualizer:
         plt.plot(iterations, precision, 'o-', color='green', label='Precision')
         plt.plot(iterations, recall, 'o-', color='red', label='Recall')
         plt.plot(iterations, f1_score, 'o-', color='purple', label='F1-Score')
-        plt.plot(iterations, mean_metrics, 'o-', color='black', linestyle='--', linewidth=2, label='Mean')
+        # Fix the redundant linestyle definition
+        plt.plot(iterations, mean_metrics, marker='o', color='black', linestyle='--', linewidth=2, label='Mean')
         
         plt.title('Performance Metrics Across Training Iterations', fontsize=16)
         plt.xlabel('Training Iteration', fontsize=12)
