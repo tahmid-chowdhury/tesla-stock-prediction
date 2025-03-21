@@ -514,15 +514,19 @@ class LSTMModel:
             logging.error("Model not trained or loaded. Cannot make predictions.")
             return None
         
+        # First, check if we're dealing with a custom TensorFlowTrainer model
+        # These models don't support use_ensemble and return_confidence parameters
+        is_custom_model = hasattr(self.model, 'predict') and not hasattr(self.model, 'predict.__func__')
+        
         try:
             # For standard Keras model (no ensemble)
             if not use_ensemble or not self.ensemble_models:
-                # Make standard prediction - handle both custom models and standard TF models
-                if hasattr(self.model, 'predict') and callable(self.model.predict):
+                if is_custom_model:
+                    # Standard TensorFlow prediction without custom parameters
                     predictions = self.model.predict(X)
                 else:
-                    logging.error("Model doesn't have a predict method")
-                    return None
+                    # Our custom model prediction
+                    predictions = self.model.predict(X)
                 
                 # If confidence intervals are requested, generate them
                 if return_confidence:
@@ -532,13 +536,14 @@ class LSTMModel:
                     
                     # Create bootstrap samples by adding noise
                     for _ in range(n_samples):
-                        # Add dropout noise during inference
-                        if hasattr(self.model, 'predict_with_dropout') and callable(self.model.predict_with_dropout):
-                            # Use custom implementation if available
-                            bootstrap_preds.append(self.model.predict_with_dropout(X))
-                        else:
-                            # Fallback: add Gaussian noise to inputs for uncertainty
+                        if is_custom_model:
+                            # Add Gaussian noise to inputs for uncertainty
                             noise_level = 0.01  # Small amount of noise
+                            noisy_X = X + np.random.normal(0, noise_level, X.shape)
+                            bootstrap_preds.append(self.model.predict(noisy_X))
+                        else:
+                            # Use our model's predict method
+                            noise_level = 0.01
                             noisy_X = X + np.random.normal(0, noise_level, X.shape)
                             bootstrap_preds.append(self.model.predict(noisy_X))
                     
@@ -562,7 +567,8 @@ class LSTMModel:
                 
                 return predictions
             
-            # For ensemble models
+            # For ensemble models - this part is only used if we have ensemble models
+            # and use_ensemble is True
             else:
                 logging.info(f"Making ensemble prediction with {len(self.ensemble_models)} models")
                 ensemble_predictions = []
@@ -570,38 +576,59 @@ class LSTMModel:
                 # Get predictions from each model in the ensemble
                 for model_info in self.ensemble_models:
                     model = model_info['model']
-                    pred = model.predict(X)
-                    ensemble_predictions.append(pred)
+                    if hasattr(model, 'predict'):
+                        pred = model.predict(X)
+                        ensemble_predictions.append(pred)
                 
                 # Combine predictions (average)
-                ensemble_predictions = np.array(ensemble_predictions)
-                mean_prediction = np.mean(ensemble_predictions, axis=0)
-                
-                # If confidence intervals are requested
-                if return_confidence:
-                    std_prediction = np.std(ensemble_predictions, axis=0)
+                if ensemble_predictions:
+                    ensemble_predictions = np.array(ensemble_predictions)
+                    mean_prediction = np.mean(ensemble_predictions, axis=0)
                     
-                    # Calculate 95% confidence intervals
-                    lower_95 = mean_prediction - 1.96 * std_prediction
-                    upper_95 = mean_prediction + 1.96 * std_prediction
+                    # If confidence intervals are requested
+                    if return_confidence:
+                        std_prediction = np.std(ensemble_predictions, axis=0)
+                        
+                        # Calculate 95% confidence intervals
+                        lower_95 = mean_prediction - 1.96 * std_prediction
+                        upper_95 = mean_prediction + 1.96 * std_prediction
+                        
+                        # Return predictions with confidence intervals
+                        confidence_intervals = {
+                            'lower_95': lower_95,
+                            'upper_95': upper_95,
+                            'std': std_prediction
+                        }
+                        
+                        return mean_prediction, confidence_intervals
                     
-                    # Return predictions with confidence intervals
-                    confidence_intervals = {
-                        'lower_95': lower_95,
-                        'upper_95': upper_95,
-                        'std': std_prediction
-                    }
+                    return mean_prediction
+                else:
+                    # Fallback to standard prediction if ensemble is empty
+                    logging.warning("Ensemble is empty. Using standard model.")
+                    predictions = self.model.predict(X)
                     
-                    return mean_prediction, confidence_intervals
-                
-                return mean_prediction
-                
+                    if return_confidence:
+                        # Simple confidence estimation based on prediction value
+                        std_prediction = np.abs(predictions) * 0.1  # 10% of prediction as std
+                        lower_95 = predictions - 1.96 * std_prediction
+                        upper_95 = predictions + 1.96 * std_prediction
+                        
+                        confidence_intervals = {
+                            'lower_95': lower_95,
+                            'upper_95': upper_95,
+                            'std': std_prediction
+                        }
+                        
+                        return predictions, confidence_intervals
+                    
+                    return predictions
         except Exception as e:
             logging.error(f"Error during prediction: {e}")
             import traceback
             logging.error(traceback.format_exc())
             
-            # Return None or a fallback prediction
+            # Return zeros or a fallback prediction
             if return_confidence:
                 return np.zeros((len(X), self.prediction_horizon)), {
                     'lower_95': np.zeros((len(X), self.prediction_horizon)),
